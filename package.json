@@ -1,0 +1,26 @@
+{
+  "name": "flyrank-capstone-social-studio",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Turn one blog post into a social campaign: generate, review and publish variants exactly once.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "npm run build && node --disable-warning=ExperimentalWarning dist/main.js",
+    "api": "npm run build && node --disable-warning=ExperimentalWarning dist/main.js --api",
+    "worker": "npm run build && node --disable-warning=ExperimentalWarning dist/main.js --worker",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.13.0",
+    "typescript": "^5.7.0"
+  }
+}
