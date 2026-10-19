@@ -2,6 +2,8 @@ import express, { type Express } from 'express';
 import type { Config } from '../config.js';
 import { queryOne, type Db } from '../db/index.js';
 import { errorHandler, notFoundHandler } from './errors.js';
+import { mockRoutes } from './routes/mock.js';
+import { MockPostRepository } from '../publishers/mock.js';
 import { platformRoutes } from './routes/platforms.js';
 import { postRoutes } from './routes/posts.js';
 import { PostRepository } from '../posts/repository.js';
@@ -44,6 +46,8 @@ export function createApp({ config, db }: AppDeps): Express {
   const variants = new VariantRepository(db);
   const variantService = new VariantService(db, variants, config);
   app.use(variantRoutes(variantService, variants, posts, config));
+
+  app.use(mockRoutes(new MockPostRepository(db)));
 
   app.use(notFoundHandler);
   app.use(errorHandler);

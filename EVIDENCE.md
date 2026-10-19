@@ -23,7 +23,7 @@ Transcripts were captured on Node 24.14.0, Windows 11, against a fresh (deleted)
 | 1 | Ingestion via URL or Markdown, stored; generation reads only the stored post | **Done** | [E1](#e1-ingestion-via-url-or-markdown) |
 | 2 | Constraint profiles enforced by code; a bad variant is blocked | **Done** | [E2](#e2-constraint-profiles-are-enforced-by-code) |
 | 3 | Review workflow; unapproved schedule returns 4xx + message | **Partly done**: statuses and approve/edit/reject proved ([E3](#e3-review-workflow)); the unapproved-schedule 4xx needs the schedule endpoint (phase 4) | [E3](#e3-review-workflow) |
-| 4 | Adapter layer: one interface, one real target, >= 2 mocks; swap = config only | Phase 4 | |
+| 4 | Adapter layer: one interface, one real target, >= 2 mocks; swap = config only | **Partly done**: interface and both mocks proved ([E4](#e4-adapter-layer)); the real Discord adapter is the next step | [E4](#e4-adapter-layer) |
 | 5 | Idempotent publish: same variant + slot never posts twice, even under retries | Phase 4 | |
 | 6 | Durable scheduling: worker restart mid-batch, zero duplicates | Phase 5 | |
 | 7 | Publish history: every attempt recorded and visible, with its result | Phase 5 | |
@@ -195,15 +195,17 @@ npm test
 ```
 
 ```text
-ℹ tests 48
-ℹ pass 48
+ℹ tests 57
+ℹ pass 57
 ℹ fail 0
 ```
 
-19 cases in [src/platforms/validate.test.ts](src/platforms/validate.test.ts) cover the validator, 19 in
-[src/variants/generator.test.ts](src/variants/generator.test.ts) cover generation and shaping notes
-(listed in [E2d](#e2d-generation-cannot-produce-a-rule-breaking-variant)), and 10 in
-[src/variants/workflow.test.ts](src/variants/workflow.test.ts) cover the review transitions ([E3](#e3-review-workflow)).
+The suite breaks down as: 19 in [src/platforms/validate.test.ts](src/platforms/validate.test.ts) for the
+validator (listed below), 19 in [src/variants/generator.test.ts](src/variants/generator.test.ts) for
+generation and shaping notes ([E2d](#e2d-generation-cannot-produce-a-rule-breaking-variant)), 10 in
+[src/variants/workflow.test.ts](src/variants/workflow.test.ts) for the review transitions
+([E3](#e3-review-workflow)), and 9 in [src/publishers/mock.test.ts](src/publishers/mock.test.ts) for the
+mock adapters ([E4d](#e4d-the-mocks-dedupe-by-idempotency-key)).
 
 The validator cases:
 
@@ -419,6 +421,103 @@ Two rules are enforced that the transcript cannot show, both covered by tests in
 Status updates use a compare-and-set (`UPDATE ... WHERE id = ? AND status = ?`). If two reviewers act at the
 same time, the second gets a `409 concurrent_update` instead of overwriting the first decision. That is
 optimistic concurrency, the same idea as a `rowversion` check in EF Core.
+
+## E4: adapter layer
+
+**Requirement.** One `SocialPublisher` interface, at least three implementations (one real, two mocks), and
+swapping adapters is configuration only.
+
+This section covers the interface and the two mocks. The real Discord adapter, and the probe 6 end-to-end
+swap of a whole campaign, follow in the next steps.
+
+### E4a: one interface, and one place that knows adapter names
+
+The interface is in [src/publishers/types.ts](src/publishers/types.ts). `createPublisher` in
+[src/publishers/index.ts](src/publishers/index.ts) is the only code that maps a name to an implementation:
+
+```bash
+grep -rn "MockPublisher\|DiscordPublisher" src/ --include=*.ts | grep -v "src/publishers/"
+```
+
+```text
+(no matches)
+```
+
+Nothing outside `src/publishers/` names a concrete adapter, so the worker, the routes and the services
+cannot know where a post goes. That is what makes probe 6 a config change and not a code change.
+
+Two files do import from `src/publishers/`, and neither is business logic:
+
+```bash
+grep -rln "publishers/" src/ --include=*.ts
+```
+
+```text
+src/http/app.ts
+src/http/routes/mock.ts
+```
+
+`app.ts` wires the module up, and `routes/mock.ts` serves the preview pages, which exist only because a mock
+has no live message to link to. Both use the repository, not a publisher.
+
+### E4b: the adapter mapping comes from configuration
+
+`GET /health` reports the live mapping, so the swap is verifiable without reading `.env`:
+
+```bash
+PLATFORMS=x,linkedin PUBLISHER_X=mock_linkedin npm start
+curl -s localhost:3000/health
+```
+
+```json
+{"status":"ok","posts":0,"platforms":["x","linkedin"],"publishers":{"x":"mock_linkedin","linkedin":"mock_linkedin"}}
+```
+
+`x` is a platform (its content rules: 280 characters, 2 hashtags) while `mock_linkedin` is an adapter (where
+the text is sent). Keeping them separate is what lets one be re-pointed without touching the other.
+
+### E4c: the mocks store what they would have posted, with a preview
+
+```bash
+curl -s -H 'accept: application/json' localhost:3000/mock/posts/1
+curl -s -H 'accept: text/html'       localhost:3000/mock/posts/1   # a page a reviewer can read
+```
+
+```json
+{"id":1,"adapter":"mock_x","idempotencyKey":"variant:1:slot:2026-10-19T15:00","platform":"x","text":"Retries are cheap. Correctness is not. #backend","createdAt":"2026-10-19T14:44:43.236Z"}
+```
+
+The publish history stores that preview URL, so a mock publish can be followed to something a reviewer can
+actually look at, exactly as a real publish links to a live message.
+
+### E4d: the mocks dedupe by idempotency key
+
+This is the property the crash safety rests on. A mock declares `dedupesByKey: true`, which is what permits
+the worker to retry it after an ambiguous failure. Publishing the same key twice:
+
+```text
+first : {"ok":true,"externalId":"1","url":"http://localhost:3000/mock/posts/1","deduplicated":false}
+retry : {"ok":true,"externalId":"1","url":"http://localhost:3000/mock/posts/1","deduplicated":true}
+```
+
+One stored post, the same message id returned, and the retry flagged as `deduplicated` so the history can
+tell an absorbed retry from a fresh post. The guarantee is enforced by
+`UNIQUE (adapter, idempotency_key)` in the schema, not by a check in application code.
+
+Nine tests in [src/publishers/mock.test.ts](src/publishers/mock.test.ts) run against a real in-memory
+schema, so the constraint under test is the actual one:
+
+| Case | What it proves |
+|---|---|
+| publish once | the post is stored, with a preview URL and the key recorded |
+| publish the same key twice | exactly one stored post, same id returned both times |
+| the second call | reports `deduplicated: true` |
+| same key, **different text** | the first text is kept: a retry cannot rewrite a message that is already live |
+| the same key 10 times | one stored post, one id |
+| same variant, different slot | a different post, because the slot is part of the key |
+| same key on another adapter | a separate post, since each adapter is its own destination |
+| `dedupesByKey` | is `true`, which is what the worker's retry decision reads |
+| `target` | names the destination without revealing a secret |
 
 ## E8: secrets are clean
 

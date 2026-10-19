@@ -1,0 +1,38 @@
+import type { AdapterName, Config, Platform } from '../config.js';
+import type { Db } from '../db/index.js';
+import { MockPublisher } from './mock.js';
+import type { SocialPublisher } from './types.js';
+
+/**
+ * The **only** place in the codebase that maps an adapter name to an implementation.
+ *
+ * This is what makes probe 6 true: swapping a platform's adapter is a change to
+ * `.env`, not to business logic. Nothing outside this file names a concrete adapter,
+ * so the worker, the routes and the services are all unaware of Discord or the mocks.
+ */
+export function createPublisher(name: AdapterName, config: Config, db: Db): SocialPublisher {
+  switch (name) {
+    case 'mock_x':
+      return new MockPublisher('mock_x', db, config.publicBaseUrl);
+    case 'mock_linkedin':
+      return new MockPublisher('mock_linkedin', db, config.publicBaseUrl);
+    case 'discord':
+      // Added in the next step of phase 4.
+      throw new Error('The `discord` adapter is not implemented yet');
+  }
+}
+
+/**
+ * One publisher per configured platform, built once at startup. Building them up
+ * front means a misconfiguration fails at boot rather than at publish time, when a
+ * job is already due.
+ */
+export function createPublisherRegistry(config: Config, db: Db): Map<Platform, SocialPublisher> {
+  const registry = new Map<Platform, SocialPublisher>();
+  for (const platform of config.platforms) {
+    registry.set(platform, createPublisher(config.publishers[platform], config, db));
+  }
+  return registry;
+}
+
+export type { SocialPublisher } from './types.js';

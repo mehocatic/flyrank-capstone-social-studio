@@ -55,6 +55,19 @@ Honest record of how this was built: where AI (Claude Code) helped, where it was
   - Not graded but it mattered: the AI's first refusal message read "Variant is already approved, not approved", because the service appended the target status to a message that was already complete. `explainRefusal` now returns the whole sentence and the caller never appends. There is a test asserting the string does not contain "not approved".
   - **Process note, my mistake not the code's.** My first live transcript looked right but its starting state was wrong: an earlier run had failed in my shell helper *after* the curl calls had already changed the data, so the "editing clears the shaping notes" step started from a variant that had none. I rebuilt the transcript from a genuinely fresh database. Worth recording because the evidence file is only as good as the state it was captured in.
 
+## Phase 4: Adapters and idempotent publish
+
+- **2026-10-19: SocialPublisher interface and the two mocks.** `src/publishers/{types,mock,index}.ts`, the `/mock/posts/:id` preview, and 9 mock tests. `npm test` passes 57/57.
+  - The interface carries two members the first design doc did not have, both earning their place:
+    - `dedupesByKey`, the flag the entire crash-safety argument turns on. After an **ambiguous** failure the worker may retry only an adapter that returns `true`. A Discord webhook returns `false`, so it is parked instead. Putting this on the adapter means the retry decision is made from what the protocol actually guarantees, not from a guess in the worker.
+    - `deduplicated` on a success, so the history can tell a fresh post from a retry the target absorbed.
+  - Failures are classified **by the adapter** (`retryable` / `permanent` / `ambiguous`), because only the adapter knows its protocol. Misclassifying `ambiguous` as `retryable` is precisely how duplicates happen, so the type makes the choice explicit rather than letting a `catch` block decide.
+  - Mock dedupe is enforced by `UNIQUE (adapter, idempotency_key)` in the schema, using `INSERT ... ON CONFLICT DO NOTHING RETURNING id`. One statement distinguishes a fresh insert (a row comes back) from a repeat (nothing comes back), so there is no read-then-write race. Not a check in application code, which could be wrong under concurrency.
+  - A test I wrote deliberately: same key, **different text**, keeps the first text. The key identifies the intended post, so once it is sent the text is settled. A retry must not quietly rewrite a message that is already live.
+  - Mock tests run `openDatabase(':memory:')`, so they exercise the real schema and the real constraint, not a stub.
+  - `createPublisher` is the only code that maps a name to an implementation. Verified by grep: nothing outside `src/publishers/` names a concrete adapter. That grep is the probe 6 proof, recorded in EVIDENCE.
+  - Design decision recorded in `docs/DESIGN.md` before writing the worker: the crash window gets an injectable `afterSend` hook (unused in production) so a test can fail exactly between the send and the result write, plus a real kill-the-worker transcript. My requirement, because a reviewer can rerun a test but can only read a transcript.
+
 ## Cross-cutting
 
 - **2026-10-19: style.** Em dashes removed from all docs and banned going forward, per my instruction.

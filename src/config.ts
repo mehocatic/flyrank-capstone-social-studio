@@ -25,6 +25,8 @@ export interface Config {
   platforms: Platform[];
   /** Platform -> adapter that publishes it. The app never hardcodes this. */
   publishers: Record<Platform, AdapterName>;
+  /** Used to build links to mock previews, so a stored link is clickable. */
+  publicBaseUrl: string;
   discordWebhookUrl: string | undefined;
   workerPollMs: number;
   workerLeaseMs: number;
@@ -101,9 +103,13 @@ export function loadConfig(): Config {
     throw new ConfigError('DISCORD_WEBHOOK_URL must be an https URL');
   }
 
+  const port = int('PORT', 3000, 1);
+
   return {
-    port: int('PORT', 3000, 1),
+    port,
+    publicBaseUrl: str('PUBLIC_BASE_URL', `http://localhost:${port}`).replace(/\/+$/, ''),
     databaseFile: str('DATABASE_FILE', './data/studio.db'),
+    // `port` is read above, because publicBaseUrl defaults from it.
     platforms,
     publishers,
     // `exactOptionalPropertyTypes` forbids assigning undefined to an optional key,

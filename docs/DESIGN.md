@@ -37,6 +37,15 @@ the job goes back to `pending` with backoff, at most 5 attempts. `permanent` (4x
 before sending, so it goes back to `pending`. With an `in_flight` attempt, the job is retried only if the adapter
 dedupes by key (mocks do, through their UNIQUE key). Otherwise (Discord) it is parked as `unknown` for a human
 (`POST /jobs/:id/resolve`).
+**Proving the crash window.** Step 4 (send) and step 5 (record) cannot be made atomic, so the gap between
+them is the one place a crash can lose information. To prove the behaviour there twice over:
+- **An injectable seam, for an automated test.** The worker accepts an optional `afterSend` hook, unused in
+  production. A test makes it throw, which simulates the process dying *precisely* between the send
+  returning and the result being committed. No process is killed, so the test is deterministic and a
+  reviewer can rerun it.
+- **A real kill, for a transcript.** `npm run worker` is stopped by hand mid-batch and restarted, and the
+  history is then inspected. This proves it on a real run, where the test proves it repeatably.
+
 **Remaining window (honest):** Discord webhooks have no idempotency key. If the process dies after Discord
 accepts the POST but before step 5 commits, we cannot know whether the message exists. We choose
 **at-most-once** (park it) over at-least-once (risk a duplicate). `?wait=true` returns the message id
@@ -45,15 +54,29 @@ immediately, which keeps the window to about one network round trip plus one loc
 ## SocialPublisher interface
 ```ts
 type PublishResult =
-  | { ok: true; externalId: string; url: string }
+  | { ok: true; externalId: string; url: string; deduplicated: boolean }
   | { ok: false; kind: 'retryable' | 'permanent' | 'ambiguous'; error: string };
 
 interface SocialPublisher {
   readonly name: string;           // 'discord' | 'mock_x' | 'mock_linkedin'
   readonly dedupesByKey: boolean;  // true if publishing the same key twice is safe
+  readonly target: string;         // for the history view, and never a secret
   publish(req: { idempotencyKey: string; platform: Platform; text: string }): Promise<PublishResult>;
 }
 ```
+`dedupesByKey` is the flag the whole crash-safety argument turns on. After an **ambiguous** failure the
+worker may retry only an adapter that returns `true`, because the target will recognise the key and not
+post twice. An adapter returning `false` (the Discord webhook) is parked as `unknown` instead.
+`deduplicated: true` means the target recognised the key and handed back the existing message, which the
+history shows so a reviewer can tell a fresh post from an absorbed retry.
+
+Failures are classified **by the adapter**, because only the adapter knows what its protocol guarantees:
+`retryable` (provably not posted), `permanent` (provably rejected), `ambiguous` (unknown, and the dangerous
+one). Misclassifying `ambiguous` as `retryable` is exactly how duplicates happen.
+
+`createPublisher(name)` in `src/publishers/index.ts` is the **only** place that maps a name to an
+implementation. Nothing else in the codebase names a concrete adapter, which is what makes probe 6 a
+configuration change rather than a code change.
 *Platform* (content rules) and *adapter* (transport) are separate. `.env` maps them: `PUBLISHER_X=mock_x`,
 `PUBLISHER_LINKEDIN=mock_linkedin`, `PUBLISHER_DISCORD=discord`. Probe 6 changes one line
 (`PUBLISHER_DISCORD=mock_x`) and restarts. The only place that knows adapter names is the registry
