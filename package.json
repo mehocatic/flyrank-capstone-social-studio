@@ -13,6 +13,7 @@
     "start": "npm run build && node --disable-warning=ExperimentalWarning dist/main.js",
     "api": "npm run build && node --disable-warning=ExperimentalWarning dist/main.js --api",
     "worker": "npm run build && node --disable-warning=ExperimentalWarning dist/main.js --worker",
+    "test": "npm run build && node --disable-warning=ExperimentalWarning --test \"dist/**/*.test.js\"",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -6,3 +6,6 @@ dist/
 *.db-wal
 *.db-shm
 data/
+
+# stray process logs from manual runs
+*.log

@@ -2,6 +2,7 @@ import express, { type Express } from 'express';
 import type { Config } from '../config.js';
 import { queryOne, type Db } from '../db/index.js';
 import { errorHandler, notFoundHandler } from './errors.js';
+import { platformRoutes } from './routes/platforms.js';
 import { postRoutes } from './routes/posts.js';
 import { PostRepository } from '../posts/repository.js';
 import { PostService } from '../posts/service.js';
@@ -31,6 +32,8 @@ export function createApp({ config, db }: AppDeps): Express {
       publishers: Object.fromEntries(config.platforms.map((p) => [p, config.publishers[p]])),
     });
   });
+
+  app.use(platformRoutes(config));
 
   const posts = new PostRepository(db);
   app.use(postRoutes(new PostService(posts), posts));
