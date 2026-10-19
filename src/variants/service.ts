@@ -1,6 +1,7 @@
 import type { Config, Platform } from '../config.js';
 import { transaction, type Db } from '../db/index.js';
 import { conflict, unprocessable } from '../http/errors.js';
+import type { JobRepository } from '../jobs/repository.js';
 import type { Post } from '../posts/repository.js';
 import { assertValidVariant, validateVariant, type Violation } from '../platforms/validate.js';
 import { profileFor } from '../platforms/profiles.js';
@@ -20,6 +21,7 @@ export class VariantService {
   constructor(
     private readonly db: Db,
     private readonly variants: VariantRepository,
+    private readonly jobs: JobRepository,
     private readonly config: Config,
   ) {}
 
@@ -128,6 +130,14 @@ export class VariantService {
     }
 
     assertValidVariant(variant.platform, text);
+
+    // Any job still waiting to publish the old text is cancelled. Letting it run
+    // would publish words that are no longer approved, and were possibly the exact
+    // words the editor was removing.
+    const cancelled = this.jobs.cancelPendingForVariant(variant.id);
+    if (cancelled > 0) {
+      console.log(`[review] cancelled ${cancelled} pending job(s) for edited variant ${variant.id}`);
+    }
 
     if (!this.variants.updateText(variant.id, text)) {
       throw conflict(

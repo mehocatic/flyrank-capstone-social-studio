@@ -11,6 +11,9 @@ import { PostService } from '../posts/service.js';
 import { variantRoutes } from './routes/variants.js';
 import { VariantRepository } from '../variants/repository.js';
 import { VariantService } from '../variants/service.js';
+import { jobRoutes } from './routes/jobs.js';
+import { JobRepository } from '../jobs/repository.js';
+import { ScheduleService } from '../jobs/service.js';
 
 export interface AppDeps {
   config: Config;
@@ -44,8 +47,12 @@ export function createApp({ config, db }: AppDeps): Express {
   app.use(postRoutes(new PostService(posts), posts));
 
   const variants = new VariantRepository(db);
-  const variantService = new VariantService(db, variants, config);
+  const jobs = new JobRepository(db);
+
+  const variantService = new VariantService(db, variants, jobs, config);
   app.use(variantRoutes(variantService, variants, posts, config));
+
+  app.use(jobRoutes(new ScheduleService(jobs, variants, config), jobs, variants));
 
   app.use(mockRoutes(new MockPostRepository(db)));
 

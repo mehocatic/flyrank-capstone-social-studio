@@ -2,6 +2,7 @@ import process from 'node:process';
 import { loadConfig } from './config.js';
 import { openDatabase } from './db/index.js';
 import { createApp } from './http/app.js';
+import { installFatalHandlers } from './process-guards.js';
 import { redact } from './redact.js';
 
 /**
@@ -9,6 +10,10 @@ import { redact } from './redact.js';
  * process, so a stranger needs one command. `--api` / `--worker` split them, which
  * is what probe 5 needs: kill the worker while the API keeps serving history.
  */
+// Registered before anything else runs, so no failure during startup can print a
+// secret through Node's own default reporting.
+installFatalHandlers();
+
 const flags = new Set(process.argv.slice(2));
 const runApi = flags.has('--api') || !flags.has('--worker');
 const runWorker = flags.has('--worker') || !flags.has('--api');

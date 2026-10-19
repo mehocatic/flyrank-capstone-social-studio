@@ -22,9 +22,9 @@ Transcripts were captured on Node 24.14.0, Windows 11, against a fresh (deleted)
 |---|---|---|---|
 | 1 | Ingestion via URL or Markdown, stored; generation reads only the stored post | **Done** | [E1](#e1-ingestion-via-url-or-markdown) |
 | 2 | Constraint profiles enforced by code; a bad variant is blocked | **Done** | [E2](#e2-constraint-profiles-are-enforced-by-code) |
-| 3 | Review workflow; unapproved schedule returns 4xx + message | **Partly done**: statuses and approve/edit/reject proved ([E3](#e3-review-workflow)); the unapproved-schedule 4xx needs the schedule endpoint (phase 4) | [E3](#e3-review-workflow) |
+| 3 | Review workflow; unapproved schedule returns 4xx + message | **Done** | [E3](#e3-review-workflow), [E5a](#e5a-probe-3-an-unapproved-variant-cannot-be-scheduled) |
 | 4 | Adapter layer: one interface, one real target, >= 2 mocks; swap = config only | **Partly done**: interface and both mocks proved ([E4](#e4-adapter-layer)); the real Discord adapter is the next step | [E4](#e4-adapter-layer) |
-| 5 | Idempotent publish: same variant + slot never posts twice, even under retries | Phase 4 | |
+| 5 | Idempotent publish: same variant + slot never posts twice, even under retries | **Partly done**: the key, the one-job guarantee and the atomic claim are proved ([E5](#e5-the-job-store-and-scheduling)); publishing through it is the next step | [E5](#e5-the-job-store-and-scheduling) |
 | 6 | Durable scheduling: worker restart mid-batch, zero duplicates | Phase 5 | |
 | 7 | Publish history: every attempt recorded and visible, with its result | Phase 5 | |
 | 8 | Secrets clean: tokens in `.env` only; `.env.example` present | **Done** | [E8](#e8-secrets-are-clean) |
@@ -195,8 +195,8 @@ npm test
 ```
 
 ```text
-ℹ tests 89
-ℹ pass 89
+ℹ tests 118
+ℹ pass 118
 ℹ fail 0
 ```
 
@@ -208,6 +208,8 @@ npm test
 | [src/publishers/mock.test.ts](src/publishers/mock.test.ts) | 9 | mock adapters and key dedupe ([E4d](#e4d-the-mocks-dedupe-by-idempotency-key)) |
 | [src/publishers/discord.test.ts](src/publishers/discord.test.ts) | 25 | the real adapter and its failure classification ([E4e](#e4e-the-real-discord-adapter)) |
 | [src/redact.test.ts](src/redact.test.ts) | 7 | secret redaction ([E8](#e8-secrets-are-clean)) |
+| [src/process-guards.test.ts](src/process-guards.test.ts) | 5 | crash reporting cannot leak a secret ([E8](#e8b3-nodes-own-crash-output-is-redacted-too)) |
+| [src/jobs/jobs.test.ts](src/jobs/jobs.test.ts) | 24 | slots, the job store and claiming ([E5](#e5-the-job-store-and-scheduling)) |
 
 The validator cases:
 
@@ -563,6 +565,108 @@ The tests inject a `fetch` stub, so every branch runs with no network and no rea
 Two further behaviours asserted: the request carries `allowed_mentions: {parse: []}`, so even a variant that
 somehow contained `@everyone` could not ping a server, and the URL ends in `?wait=true`.
 
+## E5: the job store and scheduling
+
+**Requirement.** Time slots, and the idempotency key per variant and slot that makes a repeated schedule
+create exactly one job. Also requirement 3's refusal: scheduling an unapproved variant returns 4xx with a
+message.
+
+### E5a: probe 3, an unapproved variant cannot be scheduled
+
+```bash
+curl -s -X POST localhost:3000/variants/1/schedule \
+  -H 'content-type: application/json' -d '{"at":"+2m"}'
+```
+
+```text
+  POST /variants/1/schedule {"at":"+2m"}      # variant is draft
+  -> [409] not_approved: Variant 1 is draft and cannot be scheduled. Only an approved variant may be
+           scheduled: approve it first with POST /variants/1/approve.
+
+  POST /variants/1/reject                     -> [200] status=rejected
+  POST /variants/1/schedule {"at":"+2m"}
+  -> [409] not_approved: Variant 1 is rejected and cannot be scheduled. Only an approved variant may be
+           scheduled: approve it first with POST /variants/1/approve.
+
+  POST /variants/1/approve                    -> [200] status=approved
+  POST /variants/1/schedule {"at":"2026-10-19T15:00:00Z"}
+  -> [201] job=1 status=pending slot=2026-10-19T15:00:00.000Z adapter=mock_x already=false
+           key=variant:1:slot:2026-10-19T15:00:00.000Z
+```
+
+The message names the status, the rule and the exact call that fixes it. `draft` and `rejected` are both
+refused, and the same variant schedules successfully once approved. That is the Phase 3 gate: unapproved
+cannot be scheduled, approved can.
+
+### E5b: the same variant and slot yields exactly one job
+
+The key is `variant:{id}:slot:{slot}`, and the slot is truncated to the whole minute in UTC. Three different
+spellings of the same instant therefore mean one job:
+
+```text
+  POST /variants/1/schedule {"at":"2026-10-19T15:00:00Z"}      -> [201] job=1 already=false
+  POST /variants/1/schedule {"at":"2026-10-19T15:00:00Z"}      -> [200] job=1 already=true
+  POST /variants/1/schedule {"at":"2026-10-19T15:00:45Z"}      -> [200] job=1 already=true
+  POST /variants/1/schedule {"at":"2026-10-19T17:00:00+02:00"} -> [200] job=1 already=true
+  POST /variants/1/schedule {"at":"2026-10-19T16:00:00Z"}      -> [201] job=2 already=false
+```
+
+`15:00:45Z` is the same slot because seconds are truncated; `17:00+02:00` is the same instant in another
+timezone. A genuinely different slot gets its own job. **201 for a new job, 200 for one that already
+existed**: sending the same request twice is not an error, it is the same intent, and it yields the same
+single job.
+
+Uniqueness is decided by a `UNIQUE` index on `idempotency_key`, not by a `SELECT` before the `INSERT`. Two
+simultaneous requests cannot both pass a check and insert: the loser catches the constraint violation and
+reads the winner's row.
+
+### E5c: editing an approved variant cancels its pending jobs
+
+A job still waiting to publish the old text would publish words that are no longer approved, and possibly
+the exact words being removed.
+
+```bash
+curl -s -X PATCH localhost:3000/variants/1 -H 'content-type: application/json' \
+  -d '{"text":"Correctness beats a bigger timeout. #backend"}'
+curl -s 'localhost:3000/jobs?variantId=1'
+```
+
+```text
+  variant 1 -> status=draft
+  job=1 slot=2026-10-19T15:00:00.000Z status=cancelled
+  job=2 slot=2026-10-19T16:00:00.000Z status=cancelled
+
+server log: [review] cancelled 2 pending job(s) for edited variant 1
+```
+
+The variant is back to `draft`, so it also cannot be rescheduled until someone approves the new words:
+
+```text
+  POST /variants/1/schedule {"at":"+2m"}
+  -> [409] not_approved: Variant 1 is draft and cannot be scheduled.
+```
+
+### E5d: the job store, proved by tests
+
+24 tests in [src/jobs/jobs.test.ts](src/jobs/jobs.test.ts), against the real schema in memory:
+
+| Group | What it proves |
+|---|---|
+| slots | seconds truncated; every timezone normalised to UTC; `+2m` accepted; bad input refused with 400 |
+| same variant and slot | one job from 2 calls and from 10; a different slot or variant is a different job |
+| claiming | **exactly one** of two workers gets a job; a job is not claimed before its slot; the earliest due job goes first |
+| claiming | `attempts` increments at the claim, not after the send, so a crash loop cannot retry for ever |
+| leases | a lease is set in the future, and an expired lease is detectable, which is how a dead worker is found |
+| settling | a success clears the lease; a worker that lost its lease **cannot** overwrite the recorded outcome |
+| releasing | a job returns to `pending` with a later `run_after`, and does not get its used attempt back |
+| parking | an `ambiguous` job becomes `unknown` and **no worker can claim it again** |
+| cancelling | a pending job cancels; a settled job keeps its outcome; editing cancels all pending jobs for a variant |
+| resolving | a human decision applies only to a job parked as `unknown` |
+
+The claim is a single `UPDATE ... WHERE status = 'pending' ... RETURNING *`. SQLite serialises writers, so of
+two workers racing for the same row exactly one matches and the other updates nothing. There is no window
+between checking and claiming, which a `SELECT` followed by an `UPDATE` would have.
+
 ## E8: secrets are clean
 
 **Requirement.** Tokens live in `.env` only, which is never committed, and `.env.example` ships.
@@ -657,3 +761,55 @@ src/http/errors.ts:52:  // webhook URL in its message, and this log is the one p
 
 `SocialPublisher.target`, which the history view shows, deliberately describes the destination without the
 URL: `"Discord webhook (URL read from .env, never stored or logged)"`.
+
+### E8b3: Node's own crash output is redacted too
+
+The measures above cover text the application prints. **Node prints two things itself**, straight to stderr,
+before application code sees them: an unhandled promise rejection and an uncaught exception. Its default
+output includes the full error and its `cause`, which is exactly where `fetch` puts the request URL. So a
+rejected promise from a publish path would have printed the secret despite everything above.
+[src/process-guards.ts](src/process-guards.ts) registers handlers that redact, report and exit non-zero.
+
+Five tests prove this in **real child processes**, because installing the handler is precisely what
+suppresses Node's default output, so nothing in-process could demonstrate it:
+
+```bash
+node --test dist/process-guards.test.js
+```
+
+```text
+▶ unhandled promise rejection
+  ✔ redacts the webhook URL that Node would otherwise print, and exits non-zero
+  ✔ redacts a rejection with a non-Error value
+▶ uncaught exception
+  ✔ redacts the webhook URL and exits non-zero
+  ✔ redacts a throw during startup, before any request is served
+▶ the control case: this is what Node does without the handlers
+  ✔ leaks the webhook URL when the handlers are not installed
+```
+
+The side-by-side transcript. Both scripts reject the same promise, shaped the way Node's `fetch` really
+fails: a bland `fetch failed` with the URL hidden in `cause`.
+
+**With the handlers installed:**
+
+```text
+[fatal] unhandled promise rejection: Error: fetch failed
+    at file:///.../guarded.mjs:4:16
+    at ModuleJob.run (node:internal/modules/esm/module_job:430:25)
+caused by: Error: socket hang up at [discord-webhook-redacted]
+```
+
+**Without them, which is Node's own default output:**
+
+```text
+Error: fetch failed
+    at file:///.../unguarded.mjs:2:16
+    at ModuleJob.run (node:internal/modules/esm/module_job:430:25) {
+  [cause]: Error: socket hang up at https://discord.com/api/webhooks/1234567890123456789/aBcDeF-ghIJKlmnOpQrStUvWxYz_0123456789
+```
+
+Both exit with code 1. The URL above is a fake of the right shape, not a real webhook.
+
+The control case matters: it proves the handler is what prevents the leak, rather than the leak being
+impossible anyway. Without it the other four assertions could pass vacuously.
