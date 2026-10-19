@@ -1,7 +1,8 @@
 # Evidence
 
-One proof per requirement from the brief. Every transcript below is real output, pasted verbatim from the
-command shown directly above it. Nothing here is illustrative or reconstructed.
+One proof per requirement from the brief. Transcripts below are real output, pasted verbatim from the
+command shown directly above them. Any redacted or reconstructed summaries are explicitly identified as
+such; output is not presented as a verbatim transcript unless it is one.
 
 Where a requirement is not built yet, the row says so rather than being left blank.
 
@@ -713,7 +714,30 @@ between checking and claiming, which a `SELECT` followed by an `UPDATE` would ha
 variant and slot posts once even under retries; a worker crash mid-batch causes no duplicate; every attempt
 is recorded in a visible history.
 
-### E6a: probe 4, the scheduler publishes and the history links to the message
+### E6a: probe 4 against the **live** Discord webhook
+
+The two screenshots below were supplied for this evidence section. The first shows the generated message
+in Discord's `#text-channel`; the second shows the corresponding row in the application's publish history.
+Together they show the real adapter (`discord`) succeeded for variant 3, with one successful attempt out of
+one. These are screenshots of the UI, not verbatim command transcripts.
+
+The history row shows job 1, slot `2026-10-19T15:50:00.000Z`, status `succeeded`, success count `1 of 1`,
+and attempt `#1 succeeded`. Its message id is visible in the screenshot. Discord shows the post under
+`Social Studio Test` → `#text-channel`, dated October 19, 2026 at 5:50 PM. The post title is “Publish
+exactly once, even when the network lies,” and its body describes the idempotency-key approach.
+
+**Discord message:**
+
+![The published campaign message in Discord](evidence/discord-live-publish.png)
+
+**Matching application publish-history row:**
+
+![Publish history showing the Discord job succeeded with one successful attempt](evidence/discord-live-history.png)
+
+The webhook URL is not present in either screenshot. The mock-backed version of this flow is
+[E6a2](#e6a2-probe-4-through-a-mock-adapter) below and can be reproduced without credentials.
+
+### E6a2: probe 4 through a mock adapter
 
 ```bash
 npm start                                            # API and worker in one process
@@ -915,7 +939,7 @@ The page states the invariant it is displaying, so a reviewer knows what to look
 > **Successes** counts the attempts the database accepted as successful: a partial unique index allows at
 > most one per job, so this column can never exceed 1, however many retries or restarts happened.
 
-Example rows appear in [E6a](#e6a-probe-4-the-scheduler-publishes-and-the-history-links-to-the-message)
+Example rows appear in [E6a](#e6a-probe-4-against-the-live-discord-webhook)
 (a clean publish) and [E6c](#e6c-probe-5b-the-same-thing-by-killing-a-real-process) (a crash, with one job
 parked and one succeeded). Errors stored here are redacted first, proved by
 [E8b2](#e8b2-the-webhook-url-cannot-reach-the-database-or-a-log).
