@@ -6,8 +6,9 @@ platform's rules. A person approves each variant, and a scheduler publishes ever
 **exactly once in effect**. Retries, timeouts and a worker crash must never produce a second post. The app
 code does not know which network it publishes to. Configuration picks an adapter per platform.
 
-Stack: Node.js 24, TypeScript, Express, SQLite via the built-in `node:sqlite` (no native build, no Docker,
-no Redis). The same SQLite file is the job store. Variant text comes from templates (no AI).
+Stack: **Node.js 24 or newer** (required: the build and all evidence were produced on 24.14), TypeScript,
+Express, SQLite via the built-in `node:sqlite` (no native build, no Docker, no Redis). The same SQLite file
+is the job store. Variant text comes from templates (no AI).
 
 ## Data model (SQLite)
 | Table | Key columns | Notes |
@@ -64,8 +65,8 @@ interface SocialPublisher {
 | `min_length` / `max_length` (Unicode code points) | 1 / 280 | 100 / 3000 | 1 / 2000 |
 | `max_hashtags` | 2 | 5 | 0 |
 | `max_exclamations` (tone) | 1 | 2 | 3 |
-| `no_shouting`: no ALL-CAPS word with ≥ 4 letters (tone) | ✓ | ✓ | – |
-| `banned_words` (tone: `lol`, `omg`, `!!!` …) | ✓ | ✓ | – |
+| `no_shouting`: no ALL-CAPS word with ≥ 4 letters (tone) | ✓ | ✓ | n/a |
+| `banned_words` (tone: `lol`, `omg`, `!!!` …) | ✓ | ✓ | n/a |
 | `no_mass_mentions` (`@everyone`, `@here`) | ✓ | ✓ | ✓ (and `allowed_mentions: {parse: []}`) |
 
 A violation returns **422** `{ error: "constraint_violation", violations: [{ rule: "max_length", platform: "x", limit: 280, actual: 312, message }] }`.

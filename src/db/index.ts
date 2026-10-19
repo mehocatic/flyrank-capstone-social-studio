@@ -48,6 +48,30 @@ export function transaction<T>(db: Db, fn: () => T): T {
   }
 }
 
+/**
+ * `node:sqlite` types every row as `Record<string, SQLOutputValue>`, because it
+ * cannot know a query's columns. These three helpers are the only place that
+ * asserts a row shape, so the unchecked cast lives in one reviewable spot instead
+ * of at every call site. The CHECK constraints in the schema are what actually keep
+ * the values inside their declared unions.
+ */
+export function queryOne<T>(db: Db, sql: string, ...params: SqlParam[]): T | undefined {
+  return db.prepare(sql).get(...params) as T | undefined;
+}
+
+export function queryAll<T>(db: Db, sql: string, ...params: SqlParam[]): T[] {
+  return db.prepare(sql).all(...params) as T[];
+}
+
+/** For INSERT/UPDATE/DELETE without RETURNING. `changes` tells you how many rows matched. */
+export function execute(db: Db, sql: string, ...params: SqlParam[]): { changes: number } {
+  const result = db.prepare(sql).run(...params);
+  return { changes: Number(result.changes) };
+}
+
+/** The value types SQLite can bind. Dates are stored as ISO strings, so they are `string`. */
+export type SqlParam = string | number | bigint | null | Uint8Array;
+
 /** True when an error is SQLite rejecting a duplicate (a UNIQUE index doing its job). */
 export function isUniqueViolation(error: unknown): boolean {
   return (

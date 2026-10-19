@@ -1,7 +1,10 @@
 import express, { type Express } from 'express';
 import type { Config } from '../config.js';
-import type { Db } from '../db/index.js';
+import { queryOne, type Db } from '../db/index.js';
 import { errorHandler, notFoundHandler } from './errors.js';
+import { postRoutes } from './routes/posts.js';
+import { PostRepository } from '../posts/repository.js';
+import { PostService } from '../posts/service.js';
 
 export interface AppDeps {
   config: Config;
@@ -18,7 +21,7 @@ export function createApp({ config, db }: AppDeps): Express {
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/health', (_req, res) => {
-    const { count } = db.prepare('SELECT COUNT(*) AS count FROM posts').get() as { count: number };
+    const count = queryOne<{ count: number }>(db, 'SELECT COUNT(*) AS count FROM posts')?.count ?? 0;
     res.json({
       status: 'ok',
       posts: count,
@@ -28,6 +31,9 @@ export function createApp({ config, db }: AppDeps): Express {
       publishers: Object.fromEntries(config.platforms.map((p) => [p, config.publishers[p]])),
     });
   });
+
+  const posts = new PostRepository(db);
+  app.use(postRoutes(new PostService(posts), posts));
 
   app.use(notFoundHandler);
   app.use(errorHandler);

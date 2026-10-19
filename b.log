@@ -1,0 +1,3 @@
+[boot] database ./data/studio.db
+[boot] platforms x, linkedin, discord
+[api] listening on http://localhost:3100
