@@ -5,10 +5,23 @@ import { SCHEDULABLE_STATUSES } from '../variants/workflow.js';
 import type { Job, JobRepository } from './repository.js';
 import { idempotencyKey, parseSlot } from './slots.js';
 
+/**
+ * What a schedule request actually did. Reported explicitly because the interesting
+ * cases are the ones that are not "created", and a boolean could not tell them apart.
+ */
+export type ScheduleAction =
+  /** A new job. 201. */
+  | 'created'
+  /** A cancelled job for this slot was brought back. 200. */
+  | 'revived'
+  /** A live job for this slot already exists. 200, and the same job comes back. */
+  | 'already_scheduled'
+  /** This variant and slot has already published. 200, and nothing happens. */
+  | 'already_published';
+
 export interface ScheduleOutcome {
   job: Job;
-  /** False when this slot was already scheduled, so the route answers 200, not 201. */
-  created: boolean;
+  action: ScheduleAction;
 }
 
 export class ScheduleService {
@@ -40,14 +53,66 @@ export class ScheduleService {
     }
 
     const slot = parseSlot(at);
-    const adapter = this.config.publishers[variant.platform];
-
-    return this.jobs.create({
+    const { job, created } = this.jobs.create({
       variantId: variant.id,
       slotAt: slot,
       idempotencyKey: idempotencyKey(variant.id, slot),
-      adapter,
+      adapter: this.config.publishers[variant.platform],
     });
+
+    if (created) return { job, action: 'created' };
+    return this.handleExistingJob(job, slot);
+  }
+
+  /**
+   * A job already exists for this variant and slot. What to do depends entirely on
+   * why it is not pending, so each status gets a deliberate answer rather than one
+   * blanket "here is the existing job".
+   */
+  private handleExistingJob(job: Job, slot: string): ScheduleOutcome {
+    switch (job.status) {
+      case 'pending':
+      case 'claimed':
+        // Already going to happen. Returning the same job is the idempotent answer.
+        return { job, action: 'already_scheduled' };
+
+      case 'succeeded':
+        // The whole point of the system: this variant and slot has posted, and asking
+        // again must not post a second time.
+        return { job, action: 'already_published' };
+
+      case 'cancelled': {
+        // Someone cancelled it and has now asked again. Without reviving, the dead row
+        // would come back with 200 and nothing would ever publish.
+        if (!this.jobs.revive(job.id, slot)) {
+          throw conflict('concurrent_update', `Job ${job.id} changed while this request ran.`, {
+            jobId: job.id,
+          });
+        }
+        return { job: this.requireJob(job.id), action: 'revived' };
+      }
+
+      case 'failed':
+        // Retrying the identical text would fail the same way. Changing the text is
+        // an edit, which resets the variant to draft and needs a fresh approval.
+        throw conflict(
+          'job_failed',
+          `Job ${job.id} for this slot already failed and is not retried automatically: ` +
+            `${job.lastError ?? 'no error recorded'}. Edit the variant to change the text, ` +
+            `or schedule a different slot.`,
+          { jobId: job.id, status: job.status, slot },
+        );
+
+      case 'unknown':
+        // The uncloseable window. Guessing here is exactly what the design refuses.
+        throw conflict(
+          'job_unresolved',
+          `Job ${job.id} for this slot is parked as unknown: nobody knows whether the message ` +
+            `was posted. Check the target, then record the answer with ` +
+            `POST /jobs/${job.id}/resolve. Scheduling again before that could post twice.`,
+          { jobId: job.id, status: job.status, slot },
+        );
+    }
   }
 
   /** Cancels a job that has not run yet. */

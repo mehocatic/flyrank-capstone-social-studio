@@ -38,6 +38,26 @@ export interface Config {
 
 class ConfigError extends Error {}
 
+/**
+ * Design-level headroom: how much longer a lease must be than the publish timeout,
+ * checked once at boot. Covers the whole claim-to-commit timeline described in
+ * docs/DESIGN.md, generously, because stretching is cheap and a duplicate post is not.
+ */
+export const LEASE_SAFETY_MARGIN_MS = 20_000;
+
+/**
+ * Runtime threshold: how much lease a worker insists on *still having* before it
+ * starts a send, on top of the publish timeout. This is only what step 3 needs,
+ * aborting the request and committing one row, so it is small.
+ *
+ * It must stay well below LEASE_SAFETY_MARGIN_MS. If the two were equal, a worker
+ * holding a freshly claimed lease of exactly `timeout + margin` would already be a
+ * few milliseconds short and would refuse to send at all, which is a bug this code
+ * actually had: jobs were released unsent and retried until a millisecond boundary
+ * happened to line up.
+ */
+export const LEASE_COMMIT_ALLOWANCE_MS = 2_000;
+
 function str(key: string, fallback?: string): string {
   const raw = process.env[key]?.trim();
   if (raw) return raw;
@@ -61,6 +81,17 @@ function oneOf<T extends string>(key: string, allowed: readonly T[], fallback: T
     throw new ConfigError(`${key} must be one of ${allowed.join(', ')}, got "${raw}"`);
   }
   return raw as T;
+}
+
+function isAllowedWebhookUrl(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.protocol === 'https:') return true;
+  return url.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]', '::1'].includes(url.hostname);
 }
 
 function parsePlatforms(): Platform[] {
@@ -87,10 +118,25 @@ export function loadConfig(): Config {
 
   const publishTimeoutMs = int('PUBLISH_TIMEOUT_MS', 10_000, 1_000);
   const workerLeaseMs = int('WORKER_LEASE_MS', 60_000, 1_000);
-  if (workerLeaseMs <= publishTimeoutMs) {
-    // Otherwise a lease can expire while the send is still in flight, and another
-    // worker could claim a job that is already talking to the network.
-    throw new ConfigError('WORKER_LEASE_MS must be greater than PUBLISH_TIMEOUT_MS');
+
+  // Why a margin and not merely "greater than": if a lease expires while worker A is
+  // still inside fetch, worker B claims the job and sends it a second time. Guarding
+  // the database write cannot prevent that, because the duplicate has already been
+  // posted. The lease must therefore outlast everything that can happen between the
+  // claim and the result being committed:
+  //   1. the gap between claiming and the request leaving (event loop, JSON encode)
+  //   2. the request itself, bounded by PUBLISH_TIMEOUT_MS
+  //   3. handling the abort and committing the outcome (one SQLite write, fsynced)
+  //   4. clock and scheduling jitter between two processes on one machine
+  // Steps 1, 3 and 4 are small but not zero, and a GC pause or a laptop suspend can
+  // stretch any of them. LEASE_SAFETY_MARGIN_MS is the headroom for all of them.
+  if (workerLeaseMs < publishTimeoutMs + LEASE_SAFETY_MARGIN_MS) {
+    throw new ConfigError(
+      `WORKER_LEASE_MS (${workerLeaseMs}) must be at least PUBLISH_TIMEOUT_MS + ` +
+        `${LEASE_SAFETY_MARGIN_MS}ms = ${publishTimeoutMs + LEASE_SAFETY_MARGIN_MS}ms. ` +
+        `A lease that can expire while a send is still in flight allows a second worker ` +
+        `to claim the job and post the message twice.`,
+    );
   }
 
   const webhookUrl = process.env.DISCORD_WEBHOOK_URL?.trim();
@@ -101,8 +147,14 @@ export function loadConfig(): Config {
         'Set it in .env, or point that platform at a mock adapter.',
     );
   }
-  if (webhookUrl && !webhookUrl.startsWith('https://')) {
-    throw new ConfigError('DISCORD_WEBHOOK_URL must be an https URL');
+  // https only, so a webhook token never crosses a network in clear. localhost is
+  // allowed over http because the request never leaves the machine, which is what
+  // makes it possible to point the real adapter at a local endpoint and test its
+  // behaviour (including a hung send) without a live webhook.
+  if (webhookUrl && !isAllowedWebhookUrl(webhookUrl)) {
+    throw new ConfigError(
+      'DISCORD_WEBHOOK_URL must be an https URL (http is allowed only for localhost)',
+    );
   }
 
   const port = int('PORT', 3000, 1);

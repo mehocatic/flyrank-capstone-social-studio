@@ -197,36 +197,55 @@ export class JobRepository {
     ).map(toJob);
   }
 
-  /** Returns a job to the queue, optionally delayed by backoff. */
-  release(id: number, runAfter: string, lastError: string | null): boolean {
+  /**
+   * Returns a job to the queue, optionally delayed by backoff.
+   * Guarded on the holder, like `settle`.
+   */
+  release(id: number, runAfter: string, lastError: string | null, workerId?: string): boolean {
     const { changes } = execute(
       this.db,
       `UPDATE jobs
           SET status = 'pending', claimed_by = NULL, lease_until = NULL,
               run_after = ?, last_error = ?, updated_at = ?
-        WHERE id = ? AND status = 'claimed'`,
+        WHERE id = ? AND status = 'claimed'
+          AND (? IS NULL OR claimed_by = ?)`,
       runAfter,
       lastError,
       nowIso(),
       id,
+      workerId ?? null,
+      workerId ?? null,
     );
     return changes === 1;
   }
 
   /**
-   * Settles a claimed job. Guarded on `status = 'claimed'`, so a worker that lost its
-   * lease cannot overwrite the outcome recorded by whoever took over.
+   * Settles a claimed job.
+   *
+   * Guarded on `status = 'claimed'` **and on the claiming worker**, so a worker whose
+   * lease expired cannot overwrite the outcome recorded by whoever took the job over.
+   * Note what this does and does not do: it protects the *record*, not the *send*. A
+   * second send is prevented by the lease margin and the pre-send lease check, not
+   * here. By the time this guard fails, any duplicate has already been posted.
    */
-  settle(id: number, status: 'succeeded' | 'failed' | 'unknown', lastError: string | null): boolean {
+  settle(
+    id: number,
+    status: 'succeeded' | 'failed' | 'unknown',
+    lastError: string | null,
+    workerId?: string,
+  ): boolean {
     const { changes } = execute(
       this.db,
       `UPDATE jobs
           SET status = ?, claimed_by = NULL, lease_until = NULL, last_error = ?, updated_at = ?
-        WHERE id = ? AND status = 'claimed'`,
+        WHERE id = ? AND status = 'claimed'
+          AND (? IS NULL OR claimed_by = ?)`,
       status,
       lastError,
       nowIso(),
       id,
+      workerId ?? null,
+      workerId ?? null,
     );
     return changes === 1;
   }
@@ -253,6 +272,31 @@ export class JobRepository {
       variantId,
     );
     return changes;
+  }
+
+  /**
+   * Brings a cancelled job back to `pending`.
+   *
+   * Needed because the idempotency key is `variant:{id}:slot:{slot}` and uniqueness
+   * lives in the index, so re-scheduling a cancelled job cannot create a second row.
+   * Without this, the row would be returned as-is and nothing would ever publish.
+   *
+   * `attempts` resets to 0: the cancellation ended the previous intent, and this is a
+   * fresh decision to publish. Reviving requires a deliberate API call every time, so
+   * there is no loop a crash could drive.
+   */
+  revive(id: number, runAfter: string): boolean {
+    const { changes } = execute(
+      this.db,
+      `UPDATE jobs
+          SET status = 'pending', attempts = 0, run_after = ?, last_error = NULL,
+              claimed_by = NULL, lease_until = NULL, updated_at = ?
+        WHERE id = ? AND status = 'cancelled'`,
+      runAfter,
+      nowIso(),
+      id,
+    );
+    return changes === 1;
   }
 
   /** Resolves a parked `unknown` job once a human has checked the target. */

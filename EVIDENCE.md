@@ -23,12 +23,12 @@ Transcripts were captured on Node 24.14.0, Windows 11, against a fresh (deleted)
 | 1 | Ingestion via URL or Markdown, stored; generation reads only the stored post | **Done** | [E1](#e1-ingestion-via-url-or-markdown) |
 | 2 | Constraint profiles enforced by code; a bad variant is blocked | **Done** | [E2](#e2-constraint-profiles-are-enforced-by-code) |
 | 3 | Review workflow; unapproved schedule returns 4xx + message | **Done** | [E3](#e3-review-workflow), [E5a](#e5a-probe-3-an-unapproved-variant-cannot-be-scheduled) |
-| 4 | Adapter layer: one interface, one real target, >= 2 mocks; swap = config only | **Partly done**: interface and both mocks proved ([E4](#e4-adapter-layer)); the real Discord adapter is the next step | [E4](#e4-adapter-layer) |
-| 5 | Idempotent publish: same variant + slot never posts twice, even under retries | **Partly done**: the key, the one-job guarantee and the atomic claim are proved ([E5](#e5-the-job-store-and-scheduling)); publishing through it is the next step | [E5](#e5-the-job-store-and-scheduling) |
-| 6 | Durable scheduling: worker restart mid-batch, zero duplicates | Phase 5 | |
-| 7 | Publish history: every attempt recorded and visible, with its result | Phase 5 | |
+| 4 | Adapter layer: one interface, one real target, >= 2 mocks; swap = config only | **Done** | [E4](#e4-adapter-layer) |
+| 5 | Idempotent publish: same variant + slot never posts twice, even under retries | **Done** | [E5b](#e5b-the-same-variant-and-slot-yields-exactly-one-job), [E6b](#e6b-probe-5a-the-crash-proved-by-a-re-runnable-test) |
+| 6 | Durable scheduling: worker restart mid-batch, zero duplicates | **Done** | [E6b](#e6b-probe-5a-the-crash-proved-by-a-re-runnable-test), [E6c](#e6c-probe-5b-the-same-thing-by-killing-a-real-process) |
+| 7 | Publish history: every attempt recorded and visible, with its result | **Done** | [E7](#e7-publish-history) |
 | 8 | Secrets clean: tokens in `.env` only; `.env.example` present | **Done** | [E8](#e8-secrets-are-clean) |
-| 9 | README: what it does, architecture, exact run steps, one command + a seed step | Phase 5 | |
+| 9 | README: what it does, architecture, exact run steps, one command + a seed step | **Done** | [E9](#e9-a-stranger-can-run-it) |
 
 ## E1: Ingestion via URL or Markdown
 
@@ -565,6 +565,46 @@ The tests inject a `fetch` stub, so every branch runs with no network and no rea
 Two further behaviours asserted: the request carries `allowed_mentions: {parse: []}`, so even a variant that
 somehow contained `@everyone` could not ping a server, and the URL ends in `?wait=true`.
 
+### E4f: probe 6, the same campaign publishes through a different adapter
+
+`.env` has one line changed from `PUBLISHER_DISCORD=discord` to `PUBLISHER_DISCORD=mock_linkedin`. No code
+was touched.
+
+```bash
+grep '^PUBLISHER_DISCORD' .env        # PUBLISHER_DISCORD=mock_linkedin
+npm run seed && npm start
+curl -s localhost:3000/health
+```
+
+```json
+{"platforms":["x","linkedin","discord"],"publishers":{"x":"mock_x","linkedin":"mock_linkedin","discord":"mock_linkedin"}}
+```
+
+The `discord` **platform** still has its own content rules (2000 characters, no hashtags), and the variant
+generated for it is unchanged. Only its **adapter** moved.
+
+```bash
+curl -s -X POST localhost:3000/variants/3/schedule \
+  -H 'content-type: application/json' -d '{"at":"2026-01-01T00:00:00Z"}'
+```
+
+```json
+{"id":1,"variantId":3,"slotAt":"2026-01-01T00:00:00.000Z","status":"pending","adapter":"mock_linkedin","action":"created"}
+```
+
+```text
+[worker] job 1 published via mock_linkedin as 1
+```
+
+```json
+{"jobs":[{"jobId":1,"variantId":3,"platform":"discord","status":"succeeded","adapter":"mock_linkedin","attempts":1,"published":{"externalId":"1","externalUrl":"http://localhost:3000/mock/posts/1"},"timeline":[{"attemptNo":1,"outcome":"succeeded","externalId":"1","externalUrl":"http://localhost:3000/mock/posts/1"}]}]}
+```
+
+A `discord` variant published through `mock_linkedin`, the history records which adapter was used, and the
+message link points at a local preview page instead of Discord. Nothing reached the real channel. The same
+campaign run with `PUBLISHER_DISCORD=discord` instead produces `adapter: "discord"`, shown in
+[E6c](#e6c-probe-5b-the-same-thing-by-killing-a-real-process).
+
 ## E5: the job store and scheduling
 
 **Requirement.** Time slots, and the idempotency key per variant and slot that makes a repeated schedule
@@ -666,6 +706,219 @@ The variant is back to `draft`, so it also cannot be rescheduled until someone a
 The claim is a single `UPDATE ... WHERE status = 'pending' ... RETURNING *`. SQLite serialises writers, so of
 two workers racing for the same row exactly one matches and the other updates nothing. There is no window
 between checking and claiming, which a `SELECT` followed by an `UPDATE` would have.
+
+## E6: idempotent publish, and surviving a crash mid-publish
+
+**Requirement.** The scheduler publishes approved variants at their time through the adapter; the same
+variant and slot posts once even under retries; a worker crash mid-batch causes no duplicate; every attempt
+is recorded in a visible history.
+
+### E6a: probe 4, the scheduler publishes and the history links to the message
+
+```bash
+npm start                                            # API and worker in one process
+curl -X POST localhost:3000/variants/1/schedule \
+  -H 'content-type: application/json' -d '{"at":"+1m"}'
+```
+
+```json
+{"id":1,"variantId":1,"slotAt":"2026-10-19T15:33:00.000Z","idempotencyKey":"variant:1:slot:2026-10-19T15:33:00.000Z","status":"pending","adapter":"mock_x","attempts":0,"action":"created"}
+```
+
+At the slot, unprompted:
+
+```text
+[worker] job 1 published via mock_x as 1
+```
+
+`GET /ui/history` then shows (rendered as a table; the cells are reproduced here):
+
+```text
+job 1 | x (variant 1) | 2026-10-19T15:33:00.000Z | mock_x | succeeded | 1 of 1
+      | message: http://localhost:3000/mock/posts/1
+      | attempts: #1 succeeded
+```
+
+The **"1 of 1"** column is successes out of attempts. It can never exceed 1, because a partial unique index
+(`UNIQUE(job_id) WHERE outcome = 'succeeded'`) makes a second success a database error.
+
+### E6b: probe 5a, the crash proved by a re-runnable test
+
+The worker has an `afterSend` hook, unused in production, which runs **after the adapter returns and before
+the result is committed**. That is the one gap that cannot be made atomic. A test throws from it, simulating
+the process dying exactly there, with no process kill and no timing luck.
+
+```bash
+npm test
+```
+
+```text
+▶ probe 5: a crash between the send and the result write
+  ✔ leaves the attempt in_flight when the worker dies mid-publish
+  ✔ a restart after the crash results in exactly one published message
+  ✔ re-queues a job whose worker died BEFORE sending
+  ✔ parks a job as unknown when the adapter cannot dedupe
+```
+
+The second test is probe 5 itself: it crashes mid-publish, reproduces the exact state a hard kill leaves
+(job `claimed`, lease expired, attempt `in_flight`), starts a second worker, and asserts **one** stored
+message and **one** successful attempt.
+
+Related guarantees in the same file ([src/jobs/worker.test.ts](src/jobs/worker.test.ts), 20 tests):
+
+| Test | What it proves |
+|---|---|
+| two workers polling together | one message, one success. The claim is atomic. |
+| a job forced back to `pending` after succeeding | still one success and one message |
+| the same, with a non-deduping adapter | the send is **suppressed entirely**, never reaching the network |
+| a variant edited or rejected after scheduling | the job fails instead of publishing unapproved words |
+| lease nearly expired before sending | released **without sending**, no attempt row written |
+| the smallest lease the config allows | publishes on the first attempt (regression, see BUILDLOG) |
+| a stored error containing a webhook URL | redacted before it reaches the database |
+
+### E6c: probe 5b, the same thing by killing a real process
+
+Run as two processes so the API can be queried while the worker is killed. The real Discord adapter is
+pointed at a local endpoint that accepts the POST and never answers, which is what makes it possible to kill
+the worker while it is genuinely inside `fetch` rather than between jobs.
+
+Two due jobs: a `discord` one first in line (which will block), and a `mock_x` one behind it (which will be
+left pending). This is a mid-batch kill as well as a mid-send one.
+
+```bash
+node dist/main.js --api        # terminal 1
+node dist/main.js --worker     # terminal 2, killed below
+```
+
+```text
+two due jobs; the discord one is first in line:
+  job=1 variant=2 adapter=discord slot=2026-10-19T09:00:00.000Z status=pending
+  job=2 variant=1 adapter=mock_x  slot=2026-10-19T10:00:00.000Z status=pending
+```
+
+**The worker blocks inside the send.** The endpoint logs the request, with `?wait=true`:
+
+```text
+[hang] received POST /api/webhooks/111/fake-token-for-local-test?wait=true, never responding
+  job=1 adapter=discord status=claimed attempts=1 timeline=[#1:in_flight]
+  job=2 adapter=mock_x  status=pending attempts=0 timeline=[]
+```
+
+**Hard kill** (`Stop-Process -Force`, not Ctrl+C, so no clean shutdown runs):
+
+```text
+  worker alive: False
+  POSTs the endpoint received so far: 1
+```
+
+**Restart the worker.** Two different things happen, and both are correct:
+
+```text
+[worker] worker-3696-bfb500b7 started, polling every 1000ms
+[worker] job 2 published via mock_x as 1          <- the pending job continues immediately
+...30 seconds later, once the dead worker's lease expires...
+[worker] job 1 parked as unknown: cannot retry safely
+```
+
+The in-flight job is **left alone until its lease expires**. A restarted worker must not assume a job is
+abandoned merely because it does not hold it, since another worker could still be working on it.
+
+**Final history:**
+
+```text
+  job=1 adapter=discord status=unknown   attempts=1 successes=0
+      attempt #1: ambiguous :: worker died mid-send and this adapter cannot dedupe; parked for a human to resolve
+  job=2 adapter=mock_x    status=succeeded attempts=1 successes=1
+      attempt #1: succeeded id=1
+
+POSTs the hanging endpoint received IN TOTAL: 1
+```
+
+**That last line is the proof.** Exactly one POST reached the target across the kill and the restart. Zero
+duplicates. The mid-batch job completed exactly once, and the ambiguous one is parked rather than guessed at.
+
+The human resolution, which is the documented way out of the uncloseable window:
+
+```bash
+curl -X POST localhost:3000/jobs/1/resolve -H 'content-type: application/json' \
+  -d '{"outcome":"failed","note":"checked the channel, nothing arrived"}'
+```
+
+```text
+  job 1 -> failed
+  note: resolved by a human: failed. checked the channel, nothing arrived
+```
+
+### E6d: 40 jobs, one hard kill, no duplicates anywhere
+
+A larger batch at the smallest lease configuration the app permits (10 s timeout, 30 s lease):
+
+```text
+jobs by attempts used: {"1":40}
+jobs by successes    : {"1":40}
+total attempt rows   : 40
+mock_posts rows: 40
+distinct keys  : 40
+```
+
+Every job: one attempt, one success, one stored message, 40 distinct idempotency keys. No job retried, none
+duplicated.
+
+### E6e: re-scheduling a slot that already has a job
+
+The key is `variant:{id}:slot:{slot}` and uniqueness lives in the index, so a second request can never create
+a second row. What happens instead depends on **why** the existing job is not pending, and each case is a
+deliberate answer rather than "here is the row":
+
+```text
+POST /variants/1/schedule {"at":"2026-10-19T15:00:00Z"}   -> [201] action=created  job=1 status=pending
+POST /jobs/1/cancel                                       -> [200] status=cancelled
+POST /variants/1/schedule {"at":"2026-10-19T15:00:00Z"}   -> [200] action=revived  job=1 status=pending
+
+  job=1 status=pending attempts=0 runAfter=2026-10-19T15:00:00.000Z lastError=null
+```
+
+**Cancel then reschedule revives the job**, with `attempts` reset and the old error cleared. Returning the
+cancelled row with 200 would have been a silent failure: the caller is told "scheduled" and nothing ever
+publishes. Reviving needs a deliberate API call each time, so no crash loop can drive it.
+
+The other four states, with the job forced into each:
+
+```text
+(job 1 forced to status 'succeeded')
+POST /variants/1/schedule -> [200] action=already_published job=1 status=succeeded
+
+(job 1 forced to status 'failed')
+POST /variants/1/schedule -> [409] job_failed: Job 1 for this slot already failed and is not retried
+  automatically: Discord rejected the request with 400. Edit the variant to change the text, or schedule
+  a different slot.
+
+(job 1 forced to status 'unknown')
+POST /variants/1/schedule -> [409] job_unresolved: Job 1 for this slot is parked as unknown: nobody knows
+  whether the message was posted. Check the target, then record the answer with POST /jobs/1/resolve.
+  Scheduling again before that could post twice.
+```
+
+`already_published` is the guarantee itself: asking again for a slot that has posted does nothing. The two
+409s refuse to guess, and each names the action that resolves it.
+
+## E7: publish history
+
+**Requirement.** Every attempt recorded and visible, with its result.
+
+`GET /history` returns JSON; `GET /ui/history` renders a page. Both show, per job: the platform, the slot,
+the adapter used, the job status, successes out of attempts, a link to the live message, and the full
+attempt timeline with the error on each failed attempt.
+
+The page states the invariant it is displaying, so a reviewer knows what to look for:
+
+> **Successes** counts the attempts the database accepted as successful: a partial unique index allows at
+> most one per job, so this column can never exceed 1, however many retries or restarts happened.
+
+Example rows appear in [E6a](#e6a-probe-4-the-scheduler-publishes-and-the-history-links-to-the-message)
+(a clean publish) and [E6c](#e6c-probe-5b-the-same-thing-by-killing-a-real-process) (a crash, with one job
+parked and one succeeded). Errors stored here are redacted first, proved by
+[E8b2](#e8b2-the-webhook-url-cannot-reach-the-database-or-a-log).
 
 ## E8: secrets are clean
 
@@ -813,3 +1066,69 @@ Both exit with code 1. The URL above is a fake of the right shape, not a real we
 
 The control case matters: it proves the handler is what prevents the leak, rather than the leak being
 impossible anyway. Without it the other four assertions could pass vacuously.
+
+## E9: a stranger can run it
+
+**Requirement.** A README with what it does, an architecture diagram, and exact run steps: one command,
+plus a seed step for sample data.
+
+Verified from a clean state: `dist/`, `data/` and `.env` deleted, and every environment variable unset, so
+nothing left over from development could help.
+
+```bash
+npm install
+cp .env.example .env
+npm run seed
+```
+
+```text
+Post 1: "Publish exactly once, even when the network lies"
+  variant 1 [x] approved, 142/280 characters, 1 shaping note(s)
+  variant 2 [linkedin] approved, 442/3000 characters
+  variant 3 [discord] approved, 323/2000 characters
+
+Adapters in use: {"x":"mock_x","linkedin":"mock_linkedin","discord":"mock_linkedin"}
+
+Try next:
+  curl localhost:3000/posts/1/variants
+  curl -X POST localhost:3000/variants/1/schedule -H 'content-type: application/json' -d '{"at":"+2m"}'
+  open http://localhost:3000/ui/history
+```
+
+`.env.example` points every platform at a mock adapter, so **no credentials are needed to run it**. The
+seed goes through the same services the API uses, so if generation or validation were broken the seed would
+fail rather than quietly insert rows the application would have refused.
+
+Then one command runs everything:
+
+```bash
+npm start
+```
+
+```text
+[boot] database ./data/studio.db
+[boot] platforms x, linkedin, discord
+[worker] worker-31916-41e4b1af started, polling every 2000ms
+[api] listening on http://localhost:3000
+```
+
+Both the API and the worker, in one process, no container and no database server. Scheduling the seeded
+variant one minute out and waiting produced, unprompted:
+
+```text
+[worker] job 1 published via mock_x as 1
+```
+
+`npm test` also passes with **no `.env` present and no environment variables set**, which is the state a
+reviewer's machine is in:
+
+```text
+ℹ tests 138
+ℹ pass 138
+ℹ fail 0
+```
+
+The README documents reproduction steps for every probe, including which process to kill for probe 5
+(`dist/main.js --worker`, hard kill rather than Ctrl+C, since Ctrl+C runs a clean shutdown that finishes the
+job in flight and so tests the opposite thing), how to catch it inside a send rather than between jobs, and
+exactly what to look for in the history afterwards.

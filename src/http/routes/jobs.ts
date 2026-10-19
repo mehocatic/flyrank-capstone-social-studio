@@ -18,14 +18,11 @@ export function jobRoutes(
     const variant = variants.findById(id);
     if (!variant) throw notFound(`No variant with id ${id}`);
 
-    const { job, created } = service.schedule(variant, asObject(req.body).at);
+    const { job, action } = service.schedule(variant, asObject(req.body).at);
 
-    // 201 for a new job, 200 for one that already existed. The same request twice is
-    // not an error: it is the same intent, and it yields the same single job.
-    res.status(created ? 201 : 200).json({
-      ...job,
-      alreadyScheduled: !created,
-    });
+    // 201 only for a brand new job. Everything else is 200: the same request twice is
+    // not an error, it is the same intent, and it yields the same single job.
+    res.status(action === 'created' ? 201 : 200).json({ ...job, action });
   });
 
   router.get('/jobs', (req, res) => {

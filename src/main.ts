@@ -2,6 +2,11 @@ import process from 'node:process';
 import { loadConfig } from './config.js';
 import { openDatabase } from './db/index.js';
 import { createApp } from './http/app.js';
+import { PublishAttemptRepository } from './jobs/attempts.js';
+import { JobRepository } from './jobs/repository.js';
+import { PublishWorker } from './jobs/worker.js';
+import { createPublisherRegistry } from './publishers/index.js';
+import { VariantRepository } from './variants/repository.js';
 import { installFatalHandlers } from './process-guards.js';
 import { redact } from './redact.js';
 
@@ -38,7 +43,27 @@ function main(): void {
   }
 
   if (runWorker) {
-    console.log('[worker] not implemented yet (phase 5)');
+    const worker = new PublishWorker({
+      db,
+      jobs: new JobRepository(db),
+      attempts: new PublishAttemptRepository(db),
+      variants: new VariantRepository(db),
+      publishers: createPublisherRegistry(config, db),
+      config,
+      // No hooks: the afterSend seam exists for tests and is never set here.
+    });
+    worker.start();
+
+    process.on('SIGINT', () => {
+      // Finishes the job in flight, then exits. A hard kill (SIGKILL, or closing the
+      // terminal) skips this, which is what probe 5 exercises: lease recovery.
+      void worker.stop().then(() => {
+        if (!runApi) {
+          db.close();
+          process.exit(0);
+        }
+      });
+    });
   }
 }
 

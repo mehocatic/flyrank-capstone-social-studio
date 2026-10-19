@@ -14,6 +14,8 @@ import { VariantService } from '../variants/service.js';
 import { jobRoutes } from './routes/jobs.js';
 import { JobRepository } from '../jobs/repository.js';
 import { ScheduleService } from '../jobs/service.js';
+import { PublishAttemptRepository } from '../jobs/attempts.js';
+import { historyRoutes } from './routes/history.js';
 
 export interface AppDeps {
   config: Config;
@@ -52,7 +54,9 @@ export function createApp({ config, db }: AppDeps): Express {
   const variantService = new VariantService(db, variants, jobs, config);
   app.use(variantRoutes(variantService, variants, posts, config));
 
+  const attempts = new PublishAttemptRepository(db);
   app.use(jobRoutes(new ScheduleService(jobs, variants, config), jobs, variants));
+  app.use(historyRoutes(jobs, attempts, variants));
 
   app.use(mockRoutes(new MockPostRepository(db)));
 

@@ -37,6 +37,53 @@ the job goes back to `pending` with backoff, at most 5 attempts. `permanent` (4x
 before sending, so it goes back to `pending`. With an `in_flight` attempt, the job is retried only if the adapter
 dedupes by key (mocks do, through their UNIQUE key). Otherwise (Discord) it is parked as `unknown` for a human
 (`POST /jobs/:id/resolve`).
+### The lease must outlast the publish timeout, with a margin
+A claim carries a lease. If that lease expires while worker A is **still inside `fetch`**, worker B treats
+the job as abandoned, claims it and sends the message a second time. Guarding the database write does not
+help: by then the duplicate is already posted. `settle` protects the *record*, not the *send*.
+
+So the lease has to cover everything that can happen between the claim and the result being committed:
+
+| # | Step | Bound |
+|---|---|---|
+| 1 | claim committed, request leaves (event loop, JSON encode, TLS) | small, not zero |
+| 2 | the request itself | `PUBLISH_TIMEOUT_MS` |
+| 3 | handling the abort, then committing the outcome (one fsynced SQLite write) | small, not zero |
+| 4 | clock and scheduling jitter between two processes | small, not zero |
+
+Steps 1, 3 and 4 are each tiny, and any of them can stretch without warning: a GC pause, a busy disk, a
+laptop suspending mid-send. Two different thresholds guard this, and the distinction matters:
+
+- **At boot, `LEASE_SAFETY_MARGIN_MS` (20 s):** `WORKER_LEASE_MS >= PUBLISH_TIMEOUT_MS + 20_000`, or the
+  process refuses to start and says why. This is the design-level promise that a freshly claimed job has
+  generous headroom. The defaults (10 s timeout, 60 s lease) leave 50 s.
+- **Before each send, `LEASE_COMMIT_ALLOWANCE_MS` (2 s):** the worker checks it still holds at least
+  `PUBLISH_TIMEOUT_MS + 2_000` of lease. If not, which is what a long suspend looks like, it releases the
+  job **without sending**. Nothing was sent, so releasing is always safe.
+
+The runtime threshold is deliberately much smaller than the boot margin, because it only has to cover step 3:
+aborting the request and committing one row. Using the same constant for both was a real bug in this code. A
+lease of exactly `timeout + margin` is already a few milliseconds short the instant it is claimed, so every
+job was released unsent and retried until a millisecond boundary happened to line up. See BUILDLOG.
+
+The margin is a mitigation, not a proof. A pause longer than the whole lease can still cause a double send,
+and no lease length removes that: it is the same impossibility as the Discord crash window. The pre-send
+check is what makes it survivable in practice, because a process resuming from a long pause declines to send
+rather than sending late.
+
+### Re-scheduling a slot that already has a job
+The idempotency key is `variant:{id}:slot:{slot}` and uniqueness lives in the index, so a second schedule
+request for the same minute can never create a second row. What should happen then depends entirely on why
+the existing job is not pending, so each status gets a deliberate answer rather than "here is the row":
+
+| Existing job | Answer | Why |
+|---|---|---|
+| `pending`, `claimed` | **200**, `already_scheduled`, same job | It is already going to happen. Returning the same job is the idempotent answer. |
+| `succeeded` | **200**, `already_published`, nothing happens | This is the guarantee itself: the same variant and slot must not post twice. |
+| `cancelled` | **200**, `revived`, back to `pending` with `attempts` reset | Someone cancelled it and has now asked again. Returning the dead row would mean 200 and nothing ever publishing, a silent failure. Reviving needs a deliberate API call each time, so no crash loop can drive it. |
+| `failed` | **409** `job_failed` | Retrying identical text fails identically. Changing the text is an edit, which resets the variant to `draft` and needs a fresh approval. |
+| `unknown` | **409** `job_unresolved` | Nobody knows whether the message was posted. Scheduling again before a human resolves it could post twice, which is exactly what this system refuses to guess at. |
+
 **Proving the crash window.** Step 4 (send) and step 5 (record) cannot be made atomic, so the gap between
 them is the one place a crash can lose information. To prove the behaviour there twice over:
 - **An injectable seam, for an automated test.** The worker accepts an optional `afterSend` hook, unused in
