@@ -48,6 +48,11 @@ export function assertValidVariant(platform: Platform, text: string): void {
 
 type Add = (violation: Violation) => void;
 
+/** "1 exclamation mark", "2 exclamation marks". Error messages are read by people. */
+function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : pluralForm}`;
+}
+
 /**
  * Length in Unicode code points, not UTF-16 units, so an emoji counts as one
  * character. `"ab😀".length` is 4 in JavaScript, which would mis-measure a tweet.
@@ -99,7 +104,7 @@ function checkHashtags(profile: ConstraintProfile, text: string, add: Add): void
       message:
         profile.maxHashtags === 0
           ? `${profile.label} allows no hashtags, found ${found.length}: ${found.join(' ')}`
-          : `${profile.label} allows at most ${profile.maxHashtags} hashtags, found ${found.length}: ${found.join(' ')}`,
+          : `${profile.label} allows at most ${plural(profile.maxHashtags, 'hashtag')}, found ${found.length}: ${found.join(' ')}`,
     });
   }
 }
@@ -132,7 +137,7 @@ function checkMentions(profile: ConstraintProfile, text: string, add: Add): void
       message:
         profile.maxMentions === 0
           ? `${profile.label} allows no @mentions, found ${found.length}: ${found.join(' ')}`
-          : `${profile.label} allows at most ${profile.maxMentions} @mentions, found ${found.length}: ${found.join(' ')}`,
+          : `${profile.label} allows at most ${plural(profile.maxMentions, '@mention')}, found ${found.length}: ${found.join(' ')}`,
     });
   }
 }
@@ -153,7 +158,7 @@ function checkLinks(profile: ConstraintProfile, text: string, add: Add): void {
       limit: profile.maxLinks,
       actual: found.length,
       found: [...found],
-      message: `${profile.label} allows at most ${profile.maxLinks} links, found ${found.length}`,
+      message: `${profile.label} allows at most ${plural(profile.maxLinks, 'link')}, found ${found.length}`,
     });
   }
 }
@@ -166,7 +171,7 @@ function checkExclamations(profile: ConstraintProfile, text: string, add: Add): 
       platform: profile.platform,
       limit: profile.maxExclamations,
       actual,
-      message: `${profile.label} tone allows at most ${profile.maxExclamations} exclamation marks, found ${actual}`,
+      message: `${profile.label} tone allows at most ${plural(profile.maxExclamations, 'exclamation mark')}, found ${actual}`,
     });
   }
 }

@@ -6,6 +6,9 @@ import { platformRoutes } from './routes/platforms.js';
 import { postRoutes } from './routes/posts.js';
 import { PostRepository } from '../posts/repository.js';
 import { PostService } from '../posts/service.js';
+import { variantRoutes } from './routes/variants.js';
+import { VariantRepository } from '../variants/repository.js';
+import { VariantService } from '../variants/service.js';
 
 export interface AppDeps {
   config: Config;
@@ -37,6 +40,10 @@ export function createApp({ config, db }: AppDeps): Express {
 
   const posts = new PostRepository(db);
   app.use(postRoutes(new PostService(posts), posts));
+
+  const variants = new VariantRepository(db);
+  const variantService = new VariantService(db, variants, config);
+  app.use(variantRoutes(variantService, variants, posts, config));
 
   app.use(notFoundHandler);
   app.use(errorHandler);

@@ -21,7 +21,7 @@ Transcripts were captured on Node 24.14.0, Windows 11, against a fresh (deleted)
 | # | Requirement | Status | Proof |
 |---|---|---|---|
 | 1 | Ingestion via URL or Markdown, stored; generation reads only the stored post | **Done** | [E1](#e1-ingestion-via-url-or-markdown) |
-| 2 | Constraint profiles enforced by code; a bad variant is blocked | **Partly done**: profiles and validator proved by tests ([E2](#e2-constraint-profiles-are-enforced-by-code)); the blocked-before-review transcript needs the variant endpoint (next step) | [E2](#e2-constraint-profiles-are-enforced-by-code) |
+| 2 | Constraint profiles enforced by code; a bad variant is blocked | **Done** | [E2](#e2-constraint-profiles-are-enforced-by-code) |
 | 3 | Review workflow; unapproved schedule returns 4xx + message | Phase 3 | |
 | 4 | Adapter layer: one interface, one real target, >= 2 mocks; swap = config only | Phase 4 | |
 | 5 | Idempotent publish: same variant + slot never posts twice, even under retries | Phase 4 | |
@@ -146,6 +146,46 @@ discord   adapter=mock_x        len=1-2000  tags<=0  mentions<=0  links<=3  "!"<
 `shoutLen=4` means an ALL-CAPS word of 4 or more characters is refused. `shoutLen=0` disables that rule,
 which is why Discord tolerates shouting.
 
+### E2a2: probe 1, one post becomes one valid variant per platform
+
+The post was ingested as Markdown ([E1a](#e1a-pasted-markdown) shows that step), then:
+
+```bash
+curl -s -X POST localhost:3000/posts/1/generate
+curl -s localhost:3000/posts/1/variants
+```
+
+```text
+--- Discord (message)  id=10  323/2000 chars  status=draft ---
+**Publish exactly once, even when the network lies**
+
+A retry after a timeout is the oldest way to create a duplicate post. The fix is not a bigger timeout, it is an idempotency key that the database enforces. Claim the job before you send it, write the attempt down first, and let a unique index refuse the second success.
+
+--- LinkedIn (long form)  id=9  444/3000 chars  status=draft ---
+Publish exactly once, even when the network lies
+
+A retry after a timeout is the oldest way to create a duplicate post. The fix is not a bigger timeout, it is an idempotency key that the database enforces. Claim the job before you send it, write the attempt down first, and let a unique index refuse the second success. Always assume the worker can die between the send and the commit!
+
+#idempotency #backend #sqlite #nodejs #distributedsystems
+
+--- X (short form)  id=8  142/280 chars  status=draft ---
+Publish exactly once, even when the network lies: a retry after a timeout is the oldest way to create a duplicate post.
+
+#idempotency #backend
+```
+
+Three genuinely different variants, each inside its own limits, each `draft` and so awaiting review.
+What the profiles did, visible in the output:
+
+- **Hashtag counts differ by profile.** The post carries six tags. X took 2, LinkedIn took 5, Discord took none.
+- **Tone was normalised from the source.** The post body contains `ALWAYS assume ... the commit!!! lol`.
+  The LinkedIn variant reads `Always assume ... the commit!` : de-shouted, one exclamation mark instead of
+  three, and the slang dropped. Discord, whose profile permits shouting, is left alone.
+- **Length is per platform**, and the Discord variant uses Discord's own `**bold**` formatting.
+
+Generation reads only `posts.body_md`. The source page is never re-fetched, so these variants cannot change
+underneath a reviewer.
+
 ### E2b: the validator, proved by re-runnable tests
 
 A reviewer can rerun this; it is not a transcript of one lucky run.
@@ -155,12 +195,16 @@ npm test
 ```
 
 ```text
-ℹ tests 19
-ℹ pass 19
+ℹ tests 32
+ℹ pass 32
 ℹ fail 0
 ```
 
-The 19 cases in [src/platforms/validate.test.ts](src/platforms/validate.test.ts) cover:
+19 cases in [src/platforms/validate.test.ts](src/platforms/validate.test.ts) cover the validator, and 13 in
+[src/variants/generator.test.ts](src/variants/generator.test.ts) cover generation (listed in
+[E2d](#e2d-generation-cannot-produce-a-rule-breaking-variant)).
+
+The validator cases:
 
 | Case | What it proves |
 |---|---|
@@ -183,27 +227,95 @@ The 19 cases in [src/platforms/validate.test.ts](src/platforms/validate.test.ts)
 | `assertValidVariant` | throws HTTP 422, code `constraint_violation`, details naming the rule |
 | profile limits | the numbers match the design doc (280 / 3000 / 2000, 2 / 5 / 0 hashtags) |
 
-### E2c: the error names the broken rule
+### E2c: probe 2, a rule-breaking variant is blocked before review and the error names the rule
 
-The shape built by `assertValidVariant` for `'a'.repeat(300)` on X. The status, the code and the first
-violation's rule are asserted by the test above; the surrounding JSON is how
-[src/http/errors.ts](src/http/errors.ts) serialises it. No endpoint returns it yet, so this is the shape,
-not a captured response. The live transcript follows in the next step, once `POST /posts/:id/variants`
-exists.
+One request that breaks five rules at once, to show that all of them are reported rather than only the first.
+
+```bash
+curl -s -w '\n[status %{http_code}]\n' -X POST localhost:3000/posts/1/variants \
+  -H 'content-type: application/json' \
+  -d '{"platform":"x","text":"SHIPPED the thing lol!! #a #b #c #d @everyone"}'
+```
 
 ```json
-{
-  "error": "constraint_violation",
-  "message": "Text breaks the X (short form) profile: max_length",
-  "details": {
-    "platform": "x",
-    "violations": [
-      { "rule": "max_length", "platform": "x", "limit": 280, "actual": 300,
-        "message": "X (short form) allows at most 280 characters, got 300" }
-    ]
-  }
-}
+{"error":"constraint_violation","message":"Text breaks the X (short form) profile: max_hashtags, no_mass_mentions, max_exclamations, no_shouting, banned_words","details":{"platform":"x","violations":[{"rule":"max_hashtags","platform":"x","limit":2,"actual":4,"found":["#a","#b","#c","#d"],"message":"X (short form) allows at most 2 hashtags, found 4: #a #b #c #d"},{"rule":"no_mass_mentions","platform":"x","found":["@everyone"],"message":"X (short form) forbids mass mentions, found @everyone"},{"rule":"max_exclamations","platform":"x","limit":1,"actual":2,"message":"X (short form) tone allows at most 1 exclamation mark, found 2"},{"rule":"no_shouting","platform":"x","limit":4,"found":["SHIPPED"],"message":"X (short form) tone forbids ALL-CAPS words of 4+ characters, found SHIPPED"},{"rule":"banned_words","platform":"x","found":["lol"],"message":"X (short form) tone forbids these words: lol"}]}}
+[status 422]
 ```
+
+Each violation carries the rule id, the limit, the actual value and the offending text. Single-rule cases
+behave the same way:
+
+```text
+281 characters on x  -> 422 max_length: "X (short form) allows at most 280 characters, got 335"
+one hashtag on discord -> 422 max_hashtags: "Discord (message) allows no hashtags, found 1: #backend"
+platform not in PLATFORMS -> 400 "platform" must be one of the configured platforms (x, linkedin, discord), got "instagram"
+```
+
+**Blocked means not stored.** Validation runs before the insert, so a refused variant never reaches review.
+After the refusals above, listing the post's variants showed only the three generated drafts and one valid
+manual variant: no row for any rejected text.
+
+### E2d: generation cannot produce a rule-breaking variant
+
+Shaping (truncate to fit, take the top N tags, normalise tone) is a convenience and is allowed to be
+imperfect. Validation is the gate. Generated text is validated by the same function as hand-written text,
+so a bug in a template cannot put a bad variant into review. Thirteen tests in
+[src/variants/generator.test.ts](src/variants/generator.test.ts) assert that:
+
+| Case | What it proves |
+|---|---|
+| generated text, all three platforms | passes its own profile with zero violations |
+| the three variants | differ from each other, so this is a campaign and not one text copied |
+| 6 tags on the post | X takes 2, LinkedIn 5, Discord 0 |
+| the title | appears exactly once, never duplicated into the body (regression, see BUILDLOG) |
+| `ALWAYS ... !!! lol` in the source | de-shouted, one exclamation mark, slang dropped for X |
+| the same source on Discord | left shouting, because that profile permits it |
+| a 4000-character post | every platform still inside its limit |
+| truncation with hashtags | the tail survives, so a cut never mangles a hashtag |
+| truncation with a URL | the link stays whole and usable |
+| `truncateAtWord` | cuts on a word boundary, falls back to a hard cut for one very long word, counts code points so emoji are not split |
+
+When shaping genuinely cannot satisfy a profile, generation fails loudly and stores **nothing**, rather than
+producing half a campaign:
+
+```bash
+curl -s -X POST localhost:3000/posts -H 'content-type: application/json' \
+  -d '{"markdown":"# Tiny update\n\nWe shipped the thing today."}'
+curl -s -w '\n[status %{http_code}]\n' -X POST localhost:3000/posts/3/generate
+curl -s localhost:3000/posts/3/variants
+```
+
+```json
+{"error":"constraint_violation","message":"Generated text breaks a platform profile, so nothing was stored: linkedin (min_length). The stored post is probably too short or too long for that platform.","details":{"platform":"linkedin","violations":[{"rule":"min_length","platform":"linkedin","limit":100,"actual":40,"message":"LinkedIn (long form) needs at least 100 characters, got 40"}]}}
+[status 422]
+```
+
+```text
+variants stored for post 3: 0
+```
+
+### E2e: regenerating is safe to repeat
+
+Regeneration replaces superseded drafts inside one transaction and leaves exactly one variant per platform,
+however often it runs. A variant a human has approved or published is never discarded; it is reported as
+skipped instead.
+
+```bash
+# post 1 starts with 3 generated drafts plus 1 hand-written x draft (ids 1,2,3,4)
+curl -s -X POST localhost:3000/posts/1/generate   # twice
+curl -s localhost:3000/posts/1/variants
+```
+
+```text
+before regenerate: 3:discord  2:linkedin  1:x  4:x
+  run: created=[5,6,7] replaced=[1,4,2,3]
+    stored: 7:discord  6:linkedin  5:x | per platform: {"discord":1,"linkedin":1,"x":1}
+  run: created=[8,9,10] replaced=[5,6,7]
+    stored: 10:discord  9:linkedin  8:x | per platform: {"discord":1,"linkedin":1,"x":1}
+```
+
+Both stale `x` drafts (ids 1 and 4) were replaced by the first run. An earlier version of this code replaced
+only the newest draft per platform and left duplicates behind; see BUILDLOG for that bug.
 
 ## E8: secrets are clean
 
