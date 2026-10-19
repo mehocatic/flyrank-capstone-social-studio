@@ -28,6 +28,8 @@ export interface Config {
   /** Used to build links to mock previews, so a stored link is clickable. */
   publicBaseUrl: string;
   discordWebhookUrl: string | undefined;
+  /** Optional, and not a secret: only used to build a clickable link to a message. */
+  discordGuildId: string | undefined;
   workerPollMs: number;
   workerLeaseMs: number;
   publishTimeoutMs: number;
@@ -115,6 +117,7 @@ export function loadConfig(): Config {
     // `exactOptionalPropertyTypes` forbids assigning undefined to an optional key,
     // so the type is `string | undefined` and the key is always present.
     discordWebhookUrl: webhookUrl || undefined,
+    discordGuildId: process.env.DISCORD_GUILD_ID?.trim() || undefined,
     workerPollMs: int('WORKER_POLL_MS', 2_000, 100),
     workerLeaseMs,
     publishTimeoutMs,

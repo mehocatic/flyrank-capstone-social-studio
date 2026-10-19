@@ -74,6 +74,44 @@ Failures are classified **by the adapter**, because only the adapter knows what 
 `retryable` (provably not posted), `permanent` (provably rejected), `ambiguous` (unknown, and the dangerous
 one). Misclassifying `ambiguous` as `retryable` is exactly how duplicates happen.
 
+### Discord failure classification
+The asymmetry that drives every line below: a wrong `retryable` posts the message twice, while a wrong
+`ambiguous` costs one manual resolution. So **anything that might already have been processed is
+`ambiguous`**, and only a provably-undelivered failure is `retryable`.
+
+| What happened | Class | Reasoning |
+|---|---|---|
+| Timeout (`AbortSignal` fires) | `ambiguous` | The request was already on the wire. Discord may have created the message and only the response was lost. The most likely real-world crash case. |
+| Connection reset in flight (`ECONNRESET`, `socket hang up`) | `ambiguous` | Same: the request may have been fully received and processed before the socket died. |
+| **5xx** (500, 502, 503, 504) | `ambiguous`, **not** `retryable` | A 5xx is not proof of non-delivery. Discord can accept and process a message, then fail on the way back, for example in a gateway or load balancer. Treating 5xx as retryable is the classic duplicate-post bug. |
+| 408 request timeout | `ambiguous` | The server stopped waiting on the request. Usually nothing was created, but "usually" is not a guarantee. |
+| **429** rate limited | `retryable` | Discord rejects the request at the rate limiter, before any message is created. This is the one failure class that is provably safe to retry. `retry-after` is recorded. |
+| **400** invalid payload | `permanent` | The request was understood and refused. Retrying the same body cannot change the outcome. |
+| **404** unknown webhook | `permanent` | The webhook is deleted. It will not come back. |
+| 401, 403 | `permanent` | The token is revoked or wrong. Retrying cannot fix a credential. |
+| Any other 4xx | `permanent` | A request this webhook will never accept. |
+| Connection refused, DNS failure (`ECONNREFUSED`, `ENOTFOUND`, `EAI_AGAIN`) | `retryable` | No server was ever reached, so nothing can have been posted. |
+| Anything unrecognised | `ambiguous` | Defaulting to the safe direction. A guess of `retryable` here is how a duplicate happens. |
+| **2xx with an unreadable body** | **success**, not a failure | Discord accepted the message, so a retry would post twice. Only the id is lost, and the attempt is recorded as succeeded with id `unknown`. Reporting this as a failure would cause the duplicate it looks like it is preventing. |
+
+Each row is covered by a test in `src/publishers/discord.test.ts`.
+
+### The webhook URL cannot reach the database or a log
+The webhook URL is the only real secret in the system, and the realistic leak path is not a careless
+`console.log`: it is an **error message**. Node's `fetch` embeds the request URL in thrown errors, often in a
+nested `cause`, and such text flows into `publish_attempts.error` and `jobs.last_error`, which the publish
+history serves over HTTP. Three measures, defence in depth:
+1. `redact()` in `src/redact.ts` strips any webhook URL or bare `/api/webhooks/{id}/{token}` path. It matches
+   **structurally**, not by comparing against the configured value, so a URL from a redirect, a nested cause
+   or a copy of the config is caught as well.
+2. The adapter redacts every failure string and every error body before returning it, so nothing unredacted
+   is ever handed upstream to be stored.
+3. The two places that print an arbitrary error (the Express error handler and the boot failure) redact
+   first, so a future code path that *throws* rather than returns cannot leak either.
+
+No endpoint returns the webhook URL, and `SocialPublisher.target` deliberately describes the destination
+without it. Verified by test and by a grep audit, recorded in EVIDENCE.
+
 `createPublisher(name)` in `src/publishers/index.ts` is the **only** place that maps a name to an
 implementation. Nothing else in the codebase names a concrete adapter, which is what makes probe 6 a
 configuration change rather than a code change.

@@ -195,17 +195,19 @@ npm test
 ```
 
 ```text
-ℹ tests 57
-ℹ pass 57
+ℹ tests 89
+ℹ pass 89
 ℹ fail 0
 ```
 
-The suite breaks down as: 19 in [src/platforms/validate.test.ts](src/platforms/validate.test.ts) for the
-validator (listed below), 19 in [src/variants/generator.test.ts](src/variants/generator.test.ts) for
-generation and shaping notes ([E2d](#e2d-generation-cannot-produce-a-rule-breaking-variant)), 10 in
-[src/variants/workflow.test.ts](src/variants/workflow.test.ts) for the review transitions
-([E3](#e3-review-workflow)), and 9 in [src/publishers/mock.test.ts](src/publishers/mock.test.ts) for the
-mock adapters ([E4d](#e4d-the-mocks-dedupe-by-idempotency-key)).
+| File | Tests | Covers |
+|---|---|---|
+| [src/platforms/validate.test.ts](src/platforms/validate.test.ts) | 19 | the validator (listed below) |
+| [src/variants/generator.test.ts](src/variants/generator.test.ts) | 19 | generation and shaping notes ([E2d](#e2d-generation-cannot-produce-a-rule-breaking-variant)) |
+| [src/variants/workflow.test.ts](src/variants/workflow.test.ts) | 10 | review transitions ([E3](#e3-review-workflow)) |
+| [src/publishers/mock.test.ts](src/publishers/mock.test.ts) | 9 | mock adapters and key dedupe ([E4d](#e4d-the-mocks-dedupe-by-idempotency-key)) |
+| [src/publishers/discord.test.ts](src/publishers/discord.test.ts) | 25 | the real adapter and its failure classification ([E4e](#e4e-the-real-discord-adapter)) |
+| [src/redact.test.ts](src/redact.test.ts) | 7 | secret redaction ([E8](#e8-secrets-are-clean)) |
 
 The validator cases:
 
@@ -519,6 +521,48 @@ schema, so the constraint under test is the actual one:
 | `dedupesByKey` | is `true`, which is what the worker's retry decision reads |
 | `target` | names the destination without revealing a secret |
 
+### E4e: the real Discord adapter
+
+[src/publishers/discord.ts](src/publishers/discord.ts) posts to a webhook on a Discord server I own. It is
+the third implementation of the interface, alongside the two mocks, which satisfies "one real target and at
+least two mocks".
+
+Two design points that carry the idempotency argument:
+
+- **`dedupesByKey` is `false`.** A webhook has no notion of an idempotency key, so the same request sent
+  twice creates two messages. Every retry decision upstream reads this flag, which is why an ambiguous
+  Discord failure is parked rather than retried.
+- **`?wait=true`** makes Discord return the created message instead of an empty 204. That costs one round
+  trip and buys the message id and link for the history, and a much smaller crash window, because the
+  outcome is known as early as it can be.
+
+**Failure classification** is the part where the dedupe argument either holds or quietly breaks, so each
+class has its own test. The reasoning is in
+[docs/DESIGN.md](docs/DESIGN.md#discord-failure-classification); the asymmetry behind it is that a wrong
+`retryable` posts twice while a wrong `ambiguous` costs one manual resolution.
+
+| Simulated failure | Class | Test asserts |
+|---|---|---|
+| timeout (`AbortSignal` fires) | `ambiguous` | message says the request may have been created |
+| connection reset (`ECONNRESET`) | `ambiguous` | "reset in flight" |
+| `socket hang up` | `ambiguous` | |
+| **500** | `ambiguous` | "may be after the message was created" |
+| **502, 503, 504** | `ambiguous` | each status checked separately |
+| 408 | `ambiguous` | |
+| **429** | `retryable` | `retry-after` captured from the header |
+| **400** | `permanent` | |
+| **404** unknown webhook | `permanent` | Discord's own message preserved |
+| 401, 403 | `permanent` | each checked |
+| `ECONNREFUSED` | `retryable` | "never delivered" |
+| `ENOTFOUND`, `EAI_AGAIN` | `retryable` | each checked |
+| unrecognised error | `ambiguous` | defaults to the safe direction |
+| 2xx with an unreadable body | **success** | a 2xx is never reported as a failure; id recorded as `unknown` |
+
+The tests inject a `fetch` stub, so every branch runs with no network and no real webhook.
+
+Two further behaviours asserted: the request carries `allowed_mentions: {parse: []}`, so even a variant that
+somehow contained `@everyone` could not ping a server, and the URL ends in `?wait=true`.
+
 ## E8: secrets are clean
 
 **Requirement.** Tokens live in `.env` only, which is never committed, and `.env.example` ships.
@@ -550,3 +594,66 @@ src/config.ts:92:  const webhookUrl = process.env.DISCORD_WEBHOOK_URL?.trim();
 ```
 
 Line 6 is a comment. The three real reads are the two generic helpers and the webhook URL.
+
+### E8b2: the webhook URL cannot reach the database or a log
+
+The webhook URL is the only real secret here, and the realistic leak path is not a careless `console.log`:
+it is an **error message**. Node's `fetch` embeds the request URL in thrown errors, often inside a nested
+`cause`, and that text flows into `publish_attempts.error` and `jobs.last_error`, which the publish history
+serves over HTTP.
+
+**1. Every error the adapter can return is redacted.** One test drives all eight failure paths with a
+realistically-shaped fake webhook URL, including error messages and Discord error bodies that echo the URL
+back, then asserts the URL, the token and even the numeric webhook id are absent from every stored string:
+
+```bash
+node --test dist/publishers/discord.test.js
+```
+
+```text
+▶ the webhook URL never escapes
+  ✔ redacts the URL and the token from every stored error message
+  ✔ does not expose the URL through the adapter description
+```
+
+**2. Redaction is structural, not a string comparison.** `redact()` in [src/redact.ts](src/redact.ts)
+matches the *shape* of a webhook URL, so a URL arriving from a redirect, a nested `cause` or a copy of the
+config is caught too. Seven tests in [src/redact.test.ts](src/redact.test.ts) cover the current and legacy
+hosts, versioned paths, bare `/api/webhooks/...` paths, a URL hidden in a `cause`, and that ordinary text is
+left untouched.
+
+**3. Every place that prints an arbitrary error redacts first.** Found by auditing the whole codebase rather
+than only the adapter:
+
+```bash
+grep -rn "console\." src/ --include=*.ts | grep -v '\.test\.ts'
+```
+
+```text
+src/db/index.ts:44:  console.log(`[db] added column ${table}.${column}`);
+src/http/errors.ts:54:  console.error(`[api] unhandled error: ${redactError(error)}`);
+src/main.ts:19:  console.log(`[boot] database ${config.databaseFile}`);
+src/main.ts:20:  console.log(`[boot] platforms ${config.platforms.join(', ')}`);
+src/main.ts:24:      console.log(`[api] listening on http://localhost:${config.port}`);
+src/main.ts:27:      console.log('\n[shutdown] stopping');
+src/main.ts:36:    console.log('[worker] not implemented yet (phase 5)');
+src/main.ts:46:  console.error(`[boot] failed: ${redact(error instanceof Error ? error.message : String(error))}`);
+src/publishers/discord.ts:85:      console.warn(`[discord] published but could not read the message id: ${redact(describe(error))}`);
+```
+
+Every line is either a fixed string or a redacted one. The three that print arbitrary text (the Express
+error handler, the boot failure and the adapter warning) all pass through `redact`.
+
+The audit also showed that **no route reads or returns the webhook URL**. The only mention anywhere under
+`src/http/` is a comment explaining the redaction above:
+
+```bash
+grep -rn "webhook" src/http/ --include=*.ts
+```
+
+```text
+src/http/errors.ts:52:  // webhook URL in its message, and this log is the one place that prints an
+```
+
+`SocialPublisher.target`, which the history view shows, deliberately describes the destination without the
+URL: `"Discord webhook (URL read from .env, never stored or logged)"`.

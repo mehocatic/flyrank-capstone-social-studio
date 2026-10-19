@@ -1,5 +1,6 @@
 import type { AdapterName, Config, Platform } from '../config.js';
 import type { Db } from '../db/index.js';
+import { DiscordWebhookPublisher } from './discord.js';
 import { MockPublisher } from './mock.js';
 import type { SocialPublisher } from './types.js';
 
@@ -16,9 +17,17 @@ export function createPublisher(name: AdapterName, config: Config, db: Db): Soci
       return new MockPublisher('mock_x', db, config.publicBaseUrl);
     case 'mock_linkedin':
       return new MockPublisher('mock_linkedin', db, config.publicBaseUrl);
-    case 'discord':
-      // Added in the next step of phase 4.
-      throw new Error('The `discord` adapter is not implemented yet');
+    case 'discord': {
+      if (!config.discordWebhookUrl) {
+        // loadConfig already refuses this combination, so reaching here is a bug.
+        throw new Error('The `discord` adapter needs DISCORD_WEBHOOK_URL');
+      }
+      return new DiscordWebhookPublisher({
+        webhookUrl: config.discordWebhookUrl,
+        timeoutMs: config.publishTimeoutMs,
+        guildId: config.discordGuildId,
+      });
+    }
   }
 }
 

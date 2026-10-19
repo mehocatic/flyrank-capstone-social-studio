@@ -1,4 +1,5 @@
 import type { NextFunction, Request, Response } from 'express';
+import { redactError } from '../redact.js';
 
 /**
  * One error shape for the whole API: { error, message, details? }.
@@ -47,6 +48,9 @@ export function errorHandler(
     return;
   }
   // Unexpected: log the real cause for us, return something generic to the client.
-  console.error('[api] unhandled error', error);
+  // Redacted first, because an error thrown from a publish path can carry the
+  // webhook URL in its message, and this log is the one place that prints an
+  // arbitrary error in full.
+  console.error(`[api] unhandled error: ${redactError(error)}`);
   res.status(500).json({ error: 'internal_error', message: 'Unexpected server error' });
 }
