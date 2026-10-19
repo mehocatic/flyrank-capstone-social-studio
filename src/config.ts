@@ -15,7 +15,13 @@ if (existsSync('.env')) {
 export const PLATFORMS = ['x', 'linkedin', 'discord'] as const;
 export type Platform = (typeof PLATFORMS)[number];
 
-export const ADAPTERS = ['discord', 'mock_x', 'mock_linkedin'] as const;
+/**
+ * `discord` is the one real target. The mocks store what they would have posted and
+ * serve a preview page. There is a mock per platform so a dry run never looks
+ * misleading: a Discord variant previewing as `mock_linkedin` would suggest the
+ * platform mapping were wrong when it was not.
+ */
+export const ADAPTERS = ['discord', 'mock_x', 'mock_linkedin', 'mock_discord'] as const;
 export type AdapterName = (typeof ADAPTERS)[number];
 
 export interface Config {

@@ -105,7 +105,7 @@ type PublishResult =
   | { ok: false; kind: 'retryable' | 'permanent' | 'ambiguous'; error: string };
 
 interface SocialPublisher {
-  readonly name: string;           // 'discord' | 'mock_x' | 'mock_linkedin'
+  readonly name: string;           // 'discord' | 'mock_x' | 'mock_linkedin' | 'mock_discord'
   readonly dedupesByKey: boolean;  // true if publishing the same key twice is safe
   readonly target: string;         // for the history view, and never a secret
   publish(req: { idempotencyKey: string; platform: Platform; text: string }): Promise<PublishResult>;

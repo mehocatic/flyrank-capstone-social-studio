@@ -8,7 +8,7 @@ The interesting part is not the posting. It is the promise that a retry, a timeo
 never produces a second post, and being honest about the one window where that cannot be guaranteed.
 
 - **Real publish target:** a Discord webhook on a server you own.
-- **Mock targets:** `mock_x` and `mock_linkedin` store what they would have posted and serve a preview page.
+- **Mock targets:** `mock_x`, `mock_linkedin` and `mock_discord` store what they would have posted and serve a preview page. One per platform, so a dry run never previews a Discord variant as LinkedIn.
 - **Variant text:** templates, no AI.
 - **Storage and job queue:** one SQLite file. No Docker, no Redis, no background service.
 
@@ -31,6 +31,30 @@ npm start
 
 Out of the box `.env.example` points every platform at a mock adapter, so it runs with no credentials at
 all. To publish to Discord for real, set `DISCORD_WEBHOOK_URL` (see [Publishing to Discord](#publishing-to-discord)).
+
+### If you are on Windows PowerShell
+
+Every example below uses `curl`. **In PowerShell, `curl` is an alias for
+`Invoke-WebRequest`**, which does not understand `-X`, `-H` or `-d`, so the examples fail with a parameter
+error. Two ways round it:
+
+- **Call the real curl**, which ships with Windows 10 and later, by writing `curl.exe` instead of `curl`.
+- **Or use the PowerShell-native form.** Each `curl -X POST ... -d '<json>'` becomes:
+
+  ```powershell
+  Invoke-RestMethod -Method Post -Uri http://localhost:3000/variants/3/schedule `
+    -ContentType 'application/json' -Body '{"at":"+2m"}'
+  ```
+
+  and each plain `curl <url>` becomes `Invoke-RestMethod http://localhost:3000/history`.
+  `Invoke-RestMethod` parses the JSON response, so pipe it to `ConvertTo-Json -Depth 6` to see it in full.
+
+`Invoke-RestMethod` throws on a 4xx, which several probes deliberately return. To see the body of an error
+response in PowerShell 5.1, wrap the call:
+
+```powershell
+try { Invoke-RestMethod ... } catch { $_.ErrorDetails.Message }
+```
 
 ### Seed sample data
 
@@ -434,7 +458,7 @@ Every setting is validated once at startup; a bad value is a boot failure with a
 | `DATABASE_FILE` | `./data/studio.db` | Posts, variants, jobs and history, all in one file |
 | `PUBLIC_BASE_URL` | `http://localhost:PORT` | Used to build mock preview links |
 | `PLATFORMS` | `x,linkedin,discord` | Which platforms `generate` produces variants for |
-| `PUBLISHER_X` / `PUBLISHER_LINKEDIN` / `PUBLISHER_DISCORD` | `mock_x` / `mock_linkedin` / `discord` | Adapter per platform. This is probe 6. |
+| `PUBLISHER_X` / `PUBLISHER_LINKEDIN` / `PUBLISHER_DISCORD` | `mock_x` / `mock_linkedin` / `mock_discord` | Adapter per platform: `discord`, `mock_x`, `mock_linkedin` or `mock_discord`. Defaults are all mocks, so it runs with no credentials. This line is probe 6. |
 | `DISCORD_WEBHOOK_URL` | none | Required only when an active platform uses the `discord` adapter |
 | `DISCORD_GUILD_ID` | none | Optional, not a secret, only for message links |
 | `WORKER_POLL_MS` | `2000` | |

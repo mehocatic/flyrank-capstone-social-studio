@@ -60,15 +60,30 @@ function main(): void {
     console.log(`  ${entry.platform}: skipped (${entry.reason})`);
   }
 
-  const first = created[0];
   console.log(`\nAdapters in use: ${JSON.stringify(config.publishers)}`);
+
+  // Suggest the variant that publishes to a REAL target if one is configured, because
+  // that is the interesting one (probe 4). Suggesting a mock-backed variant for a live
+  // publish walkthrough would quietly test nothing.
+  const real = created.find((variant) => config.publishers[variant.platform] === 'discord');
+  const suggested = real ?? created[0];
+
   console.log('\nTry next:');
   console.log(`  curl localhost:${config.port}/posts/${post.id}/variants`);
-  if (first) {
+  if (suggested) {
+    const target = real
+      ? `publishes for real via the ${config.publishers[suggested.platform]} adapter`
+      : `publishes through the ${config.publishers[suggested.platform]} mock`;
+    console.log(`  # variant ${suggested.id} [${suggested.platform}] ${target}`);
     console.log(
-      `  curl -X POST localhost:${config.port}/variants/${first.id}/schedule ` +
-        `-H 'content-type: application/json' -d '{"at":"+2m"}'`,
+      `  curl -X POST localhost:${config.port}/variants/${suggested.id}/schedule ` +
+        `-H "content-type: application/json" -d "{\\"at\\":\\"+2m\\"}"`,
     );
+    console.log(`  # PowerShell: curl is an alias for Invoke-WebRequest, so use curl.exe or:`);
+    console.log(
+      `  #   Invoke-RestMethod -Method Post -Uri http://localhost:${config.port}/variants/${suggested.id}/schedule \``,
+    );
+    console.log(`  #     -ContentType 'application/json' -Body '{"at":"+2m"}'`);
   }
   console.log(`  open http://localhost:${config.port}/ui/history`);
   console.log('\nThe variants are approved, so they are ready to schedule. Start the app with: npm start\n');

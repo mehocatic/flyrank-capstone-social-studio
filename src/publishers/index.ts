@@ -17,6 +17,10 @@ export function createPublisher(name: AdapterName, config: Config, db: Db): Soci
       return new MockPublisher('mock_x', db, config.publicBaseUrl);
     case 'mock_linkedin':
       return new MockPublisher('mock_linkedin', db, config.publicBaseUrl);
+    case 'mock_discord':
+      // A dry-run stand-in for the real Discord adapter, so the default setup needs
+      // no webhook while still previewing Discord variants as Discord.
+      return new MockPublisher('mock_discord', db, config.publicBaseUrl);
     case 'discord': {
       if (!config.discordWebhookUrl) {
         // loadConfig already refuses this combination, so reaching here is a bug.

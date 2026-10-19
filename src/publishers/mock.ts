@@ -16,7 +16,7 @@ export class MockPublisher implements SocialPublisher {
   readonly dedupesByKey = true;
 
   constructor(
-    readonly name: 'mock_x' | 'mock_linkedin',
+    readonly name: 'mock_x' | 'mock_linkedin' | 'mock_discord',
     private readonly db: Db,
     private readonly baseUrl: string,
   ) {}
