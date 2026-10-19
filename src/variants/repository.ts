@@ -1,6 +1,7 @@
 import type { Platform } from '../config.js';
 import type { Db } from '../db/index.js';
-import { nowIso, queryAll, queryOne } from '../db/index.js';
+import { execute, nowIso, queryAll, queryOne } from '../db/index.js';
+import type { ShapingNote } from './generator.js';
 
 /** The review workflow states from the brief. Phase 3 adds the transitions. */
 export const VARIANT_STATUSES = ['draft', 'approved', 'rejected', 'published'] as const;
@@ -12,6 +13,8 @@ export interface Variant {
   platform: Platform;
   text: string;
   status: VariantStatus;
+  /** What generation changed while shaping the source. Empty for a hand-written variant. */
+  shapingNotes: ShapingNote[];
   createdAt: string;
   updatedAt: string;
 }
@@ -22,6 +25,7 @@ interface VariantRow {
   platform: Platform;
   text: string;
   status: VariantStatus;
+  shaping_notes: string;
   created_at: string;
   updated_at: string;
 }
@@ -33,6 +37,7 @@ function toVariant(row: VariantRow): Variant {
     platform: row.platform,
     text: row.text,
     status: row.status,
+    shapingNotes: JSON.parse(row.shaping_notes) as ShapingNote[],
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -41,16 +46,17 @@ function toVariant(row: VariantRow): Variant {
 export class VariantRepository {
   constructor(private readonly db: Db) {}
 
-  insert(postId: number, platform: Platform, text: string): Variant {
+  insert(postId: number, platform: Platform, text: string, shapingNotes: ShapingNote[] = []): Variant {
     const now = nowIso();
     const row = queryOne<VariantRow>(
       this.db,
-      `INSERT INTO variants (post_id, platform, text, status, created_at, updated_at)
-       VALUES (?, ?, ?, 'draft', ?, ?)
+      `INSERT INTO variants (post_id, platform, text, status, shaping_notes, created_at, updated_at)
+       VALUES (?, ?, ?, 'draft', ?, ?, ?)
        RETURNING *`,
       postId,
       platform,
       text,
+      JSON.stringify(shapingNotes),
       now,
       now,
     );
@@ -101,6 +107,38 @@ export class VariantRepository {
       postId,
       platform,
     ).map(toVariant);
+  }
+
+  /**
+   * Moves a variant to a new status. The `WHERE status = ?` guard makes this a
+   * compare-and-set: if another request changed the status first, `changes` is 0 and
+   * the caller reports a conflict rather than overwriting someone else's decision.
+   * This is optimistic concurrency, like a rowversion check in EF Core.
+   */
+  updateStatus(id: number, from: VariantStatus, to: VariantStatus): boolean {
+    const { changes } = execute(
+      this.db,
+      'UPDATE variants SET status = ?, updated_at = ? WHERE id = ? AND status = ?',
+      to,
+      nowIso(),
+      id,
+      from,
+    );
+    return changes === 1;
+  }
+
+  /** Replaces the text of a variant and resets it to `draft` for re-review. */
+  updateText(id: number, text: string): boolean {
+    const { changes } = execute(
+      this.db,
+      // Editing wipes the shaping notes: the text is now the human's, not the generator's.
+      `UPDATE variants SET text = ?, status = 'draft', shaping_notes = '[]', updated_at = ?
+       WHERE id = ? AND status IN ('draft', 'approved', 'rejected')`,
+      text,
+      nowIso(),
+      id,
+    );
+    return changes === 1;
   }
 
   /**

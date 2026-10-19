@@ -1,11 +1,12 @@
 import type { Config, Platform } from '../config.js';
 import { transaction, type Db } from '../db/index.js';
-import { unprocessable } from '../http/errors.js';
+import { conflict, unprocessable } from '../http/errors.js';
 import type { Post } from '../posts/repository.js';
 import { assertValidVariant, validateVariant, type Violation } from '../platforms/validate.js';
 import { profileFor } from '../platforms/profiles.js';
-import { generateVariantText } from './generator.js';
-import type { Variant, VariantRepository } from './repository.js';
+import { generateVariant, type ShapingNote } from './generator.js';
+import type { Variant, VariantRepository, VariantStatus } from './repository.js';
+import { canTransition, EDITABLE_STATUSES, explainRefusal } from './workflow.js';
 
 export interface GenerateResult {
   created: Variant[];
@@ -32,7 +33,7 @@ export class VariantService {
   generate(post: Post): GenerateResult {
     const skipped: GenerateResult['skipped'] = [];
     const replaced: number[] = [];
-    const pending: { platform: Platform; text: string }[] = [];
+    const pending: { platform: Platform; text: string; notes: ShapingNote[] }[] = [];
     const failures: { platform: Platform; violations: Violation[] }[] = [];
 
     for (const platform of this.config.platforms) {
@@ -49,12 +50,12 @@ export class VariantService {
       // two variants for the same platform behind.
       replaced.push(...this.variants.listReplaceable(post.id, platform).map((v) => v.id));
 
-      const text = generateVariantText(post, platform);
+      const { text, notes } = generateVariant(post, platform);
       const violations = validateVariant(platform, text);
       if (violations.length > 0) {
         failures.push({ platform, violations });
       } else {
-        pending.push({ platform, text });
+        pending.push({ platform, text, notes });
       }
     }
 
@@ -74,7 +75,9 @@ export class VariantService {
     // replacement either both happen or neither does.
     const created = transaction(this.db, () => {
       for (const id of replaced) this.variants.deleteById(id);
-      return pending.map(({ platform, text }) => this.variants.insert(post.id, platform, text));
+      return pending.map(({ platform, text, notes }) =>
+        this.variants.insert(post.id, platform, text, notes),
+      );
     });
 
     return { created, skipped, replaced };
@@ -84,6 +87,63 @@ export class VariantService {
   createManual(post: Post, platform: Platform, text: string): Variant {
     assertValidVariant(platform, text);
     return this.variants.insert(post.id, platform, text);
+  }
+
+  /**
+   * Approve or reject. The transition table decides what is legal, and the update is
+   * a compare-and-set, so two concurrent reviewers cannot both win.
+   */
+  setStatus(variant: Variant, to: VariantStatus): Variant {
+    if (!canTransition(variant.status, to)) {
+      throw conflict('invalid_transition', explainRefusal(variant.status, to), {
+        variantId: variant.id,
+        from: variant.status,
+        to,
+      });
+    }
+
+    if (!this.variants.updateStatus(variant.id, variant.status, to)) {
+      // The guard matched nothing, so the row changed between read and write.
+      throw conflict(
+        'concurrent_update',
+        `Variant ${variant.id} was changed by someone else while this request ran. Read it again and retry.`,
+        { variantId: variant.id, expected: variant.status },
+      );
+    }
+
+    return this.reload(variant.id);
+  }
+
+  /**
+   * Edits the text of a variant. Re-validates against the platform profile, and sends
+   * the variant back to `draft`: an approval applied to different words is meaningless.
+   */
+  edit(variant: Variant, text: string): Variant {
+    if (!EDITABLE_STATUSES.includes(variant.status)) {
+      throw conflict(
+        'not_editable',
+        `Variant ${variant.id} is ${variant.status} and cannot be edited, because the message is already live`,
+        { variantId: variant.id, status: variant.status },
+      );
+    }
+
+    assertValidVariant(variant.platform, text);
+
+    if (!this.variants.updateText(variant.id, text)) {
+      throw conflict(
+        'concurrent_update',
+        `Variant ${variant.id} was changed by someone else while this request ran. Read it again and retry.`,
+        { variantId: variant.id, expected: variant.status },
+      );
+    }
+
+    return this.reload(variant.id);
+  }
+
+  private reload(id: number): Variant {
+    const fresh = this.variants.findById(id);
+    if (!fresh) throw new Error(`Variant ${id} vanished after a successful update`);
+    return fresh;
   }
 
   /** Reports how much of each profile a variant uses, for the review UI and evidence. */

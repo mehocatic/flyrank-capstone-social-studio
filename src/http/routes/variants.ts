@@ -3,7 +3,7 @@ import type { Config, Platform } from '../../config.js';
 import { badRequest, notFound } from '../errors.js';
 import { asObject, optionalString, parseId } from '../validate.js';
 import type { Post, PostRepository } from '../../posts/repository.js';
-import type { VariantRepository } from '../../variants/repository.js';
+import type { Variant, VariantRepository } from '../../variants/repository.js';
 import type { VariantService } from '../../variants/service.js';
 
 export function variantRoutes(
@@ -55,11 +55,33 @@ export function variantRoutes(
     });
   });
 
-  router.get('/variants/:id', (req, res) => {
-    const id = parseId(req.params.id, 'variant id');
+  /** Shared by the review routes below: a variant id in the path must exist. */
+  const requireVariant = (raw: string | undefined): Variant => {
+    const id = parseId(raw, 'variant id');
     const variant = variants.findById(id);
     if (!variant) throw notFound(`No variant with id ${id}`);
-    res.json(service.describe(variant));
+    return variant;
+  };
+
+  router.get('/variants/:id', (req, res) => {
+    res.json(service.describe(requireVariant(req.params.id)));
+  });
+
+  // The review workflow: approve, reject, edit.
+  router.post('/variants/:id/approve', (req, res) => {
+    res.json(service.describe(service.setStatus(requireVariant(req.params.id), 'approved')));
+  });
+
+  router.post('/variants/:id/reject', (req, res) => {
+    res.json(service.describe(service.setStatus(requireVariant(req.params.id), 'rejected')));
+  });
+
+  // PATCH, not PUT: this replaces one field of the variant, not the whole resource.
+  router.patch('/variants/:id', (req, res) => {
+    const variant = requireVariant(req.params.id);
+    const text = optionalString(asObject(req.body), 'text', 10_000);
+    if (!text) throw badRequest('"text" is required and must not be empty');
+    res.json(service.describe(service.edit(variant, text)));
   });
 
   return router;

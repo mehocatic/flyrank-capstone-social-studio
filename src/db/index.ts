@@ -22,7 +22,26 @@ export function openDatabase(file: string): Db {
   db.exec('PRAGMA busy_timeout = 5000');
 
   db.exec(SCHEMA_SQL);
+  migrate(db);
   return db;
+}
+
+/**
+ * Columns added after the first release. `CREATE TABLE IF NOT EXISTS` leaves an
+ * existing table untouched, so a database created by an earlier version needs the
+ * new column added explicitly. Each step is checked first, so running it is safe
+ * on both a fresh and an existing file. This is a deliberately tiny stand-in for a
+ * migration tool (EF Core migrations in .NET), which this project does not need yet.
+ */
+function migrate(db: Db): void {
+  ensureColumn(db, 'variants', 'shaping_notes', "TEXT NOT NULL DEFAULT '[]'");
+}
+
+function ensureColumn(db: Db, table: string, column: string, definition: string): void {
+  const columns = queryAll<{ name: string }>(db, `PRAGMA table_info(${table})`);
+  if (columns.some((c) => c.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  console.log(`[db] added column ${table}.${column}`);
 }
 
 /** ISO-8601 UTC, the single time format stored anywhere in the database. */

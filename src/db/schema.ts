@@ -21,6 +21,10 @@ CREATE TABLE IF NOT EXISTS variants (
   platform   TEXT NOT NULL CHECK (platform IN ('x', 'linkedin', 'discord')),
   text       TEXT NOT NULL,
   status     TEXT NOT NULL CHECK (status IN ('draft', 'approved', 'rejected', 'published')),
+  -- What the generator changed while shaping the source text (JSON array).
+  -- Shaping rewrites the author's words, so it is recorded rather than left invisible.
+  -- Empty for a hand-written variant, which is never shaped.
+  shaping_notes TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

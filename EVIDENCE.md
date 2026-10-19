@@ -22,7 +22,7 @@ Transcripts were captured on Node 24.14.0, Windows 11, against a fresh (deleted)
 |---|---|---|---|
 | 1 | Ingestion via URL or Markdown, stored; generation reads only the stored post | **Done** | [E1](#e1-ingestion-via-url-or-markdown) |
 | 2 | Constraint profiles enforced by code; a bad variant is blocked | **Done** | [E2](#e2-constraint-profiles-are-enforced-by-code) |
-| 3 | Review workflow; unapproved schedule returns 4xx + message | Phase 3 | |
+| 3 | Review workflow; unapproved schedule returns 4xx + message | **Partly done**: statuses and approve/edit/reject proved ([E3](#e3-review-workflow)); the unapproved-schedule 4xx needs the schedule endpoint (phase 4) | [E3](#e3-review-workflow) |
 | 4 | Adapter layer: one interface, one real target, >= 2 mocks; swap = config only | Phase 4 | |
 | 5 | Idempotent publish: same variant + slot never posts twice, even under retries | Phase 4 | |
 | 6 | Durable scheduling: worker restart mid-batch, zero duplicates | Phase 5 | |
@@ -195,14 +195,15 @@ npm test
 ```
 
 ```text
-ℹ tests 32
-ℹ pass 32
+ℹ tests 48
+ℹ pass 48
 ℹ fail 0
 ```
 
-19 cases in [src/platforms/validate.test.ts](src/platforms/validate.test.ts) cover the validator, and 13 in
-[src/variants/generator.test.ts](src/variants/generator.test.ts) cover generation (listed in
-[E2d](#e2d-generation-cannot-produce-a-rule-breaking-variant)).
+19 cases in [src/platforms/validate.test.ts](src/platforms/validate.test.ts) cover the validator, 19 in
+[src/variants/generator.test.ts](src/variants/generator.test.ts) cover generation and shaping notes
+(listed in [E2d](#e2d-generation-cannot-produce-a-rule-breaking-variant)), and 10 in
+[src/variants/workflow.test.ts](src/variants/workflow.test.ts) cover the review transitions ([E3](#e3-review-workflow)).
 
 The validator cases:
 
@@ -316,6 +317,108 @@ before regenerate: 3:discord  2:linkedin  1:x  4:x
 
 Both stale `x` drafts (ids 1 and 4) were replaced by the first run. An earlier version of this code replaced
 only the newest draft per platform and left duplicates behind; see BUILDLOG for that bug.
+
+## E2f: shaping is on the record
+
+Shaping rewrites the author's words, so each variant stores and returns a list of what changed. A reviewer
+approves the final text, which makes the change safe, but the notes make it visible rather than silent. The
+rationale is in [docs/DESIGN.md](docs/DESIGN.md#shaping-is-recorded-never-silent).
+
+The source post for this run contains `ALWAYS assume the worker can die between the send and the commit!!! lol`
+and carries six tags.
+
+```bash
+curl -s -X POST localhost:3000/posts/1/generate
+```
+
+```text
+--- x ---
+  * normalised 1 all-caps word (ALWAYS)
+  * removed 2 exclamation marks to fit the tone limit
+  * removed 1 banned word (lol)
+  * used 2 of 6 tags as hashtags
+--- linkedin ---
+  * normalised 1 all-caps word (ALWAYS)
+  * removed 2 exclamation marks to fit the tone limit
+  * removed 1 banned word (lol)
+  * used 5 of 6 tags as hashtags
+--- discord ---
+  (no shaping needed)
+```
+
+Two properties this demonstrates:
+
+- **Shaping only changes what a profile requires.** Discord permits three exclamation marks, allows no
+  hashtags and has no banned word list, so its note list is empty: nothing in the text it used needed
+  changing. The same source is changed for X, which permits one exclamation mark and two hashtags.
+  An earlier version collapsed `!!!` to `!` on every platform, including one that permits three. That was
+  wrong and is fixed: shaping never touches text that would already pass.
+- **A hand-written variant is never shaped**, so `shapingNotes` is always `[]` for one created through
+  `POST /posts/:id/variants`, and editing a variant clears the notes (the words are now the human's).
+
+## E3: review workflow
+
+**Requirement.** Statuses draft / approved / rejected / published, with approve, edit and reject endpoints.
+
+The transition rules live in one table in [src/variants/workflow.ts](src/variants/workflow.ts) and are
+asserted by 9 tests. The walkthrough below starts from a freshly generated variant (status `draft`,
+4 shaping notes) and runs every path:
+
+```bash
+curl -s -X POST localhost:3000/variants/1/approve
+curl -s -X POST localhost:3000/variants/1/reject
+curl -s -X PATCH localhost:3000/variants/1 -H 'content-type: application/json' -d '{"text":"..."}'
+```
+
+```text
+=== starting state: variant 1 (x), freshly generated ===
+  GET    /variants/1            -> [200] status=draft len=142 shapingNotes=4
+
+=== approve, then approve again ===
+  POST   /variants/1/approve    -> [200] status=approved len=142 shapingNotes=4
+  POST   /variants/1/approve    -> [409] invalid_transition: Variant is already approved
+
+=== withdraw the approval, then reconsider ===
+  POST   /variants/1/reject     -> [200] status=rejected len=142 shapingNotes=4
+  POST   /variants/1/approve    -> [200] status=approved len=142 shapingNotes=4
+
+=== edit an approved variant: re-validated, back to draft, shaping notes cleared ===
+  PATCH  /variants/1  {"text":"Correctness beats a bigger timeout. #backend"}
+                                -> [200] status=draft len=44 shapingNotes=0
+
+=== edit with rule-breaking text: refused, variant unchanged ===
+  PATCH  /variants/1  {"text":"SHIPPED it lol!! #a #b #c"}
+                                -> [422] constraint_violation: Text breaks the X (short form) profile:
+                                         max_hashtags, max_exclamations, no_shouting, banned_words
+  GET    /variants/1            -> [200] status=draft len=44 shapingNotes=0
+
+=== empty text, and a variant that does not exist ===
+  PATCH  /variants/1  {"text":"   "}
+                                -> [400] bad_request: "text" is required and must not be empty
+  POST   /variants/999/approve  -> [404] not_found: No variant with id 999
+```
+
+What this proves, line by line:
+
+| Behaviour | Why it matters |
+|---|---|
+| approving a draft returns `approved` | the happy path |
+| approving twice returns **409**, not 200 | a no-op is reported rather than silently accepted, so a caller cannot believe it changed something |
+| `approved` to `rejected` and back | an approval can be withdrawn before it publishes, and a rejection reconsidered |
+| editing an approved variant sends it back to `draft` | an approval applied to different words is meaningless, so the review has to happen again |
+| editing clears the shaping notes (4 to 0) | the text is now the human's, not the generator's |
+| a rule-breaking edit returns 422 and **leaves the variant unchanged** | the same validation gate as creation, so review never sees invalid text |
+
+Two rules are enforced that the transcript cannot show, both covered by tests instead:
+
+- **`published` is terminal.** No status can leave `published`, because a live message cannot be
+  un-published. Asserted against every status.
+- **Nothing can declare itself `published`.** No API path sets that status; only a successful publish does,
+  in phase 4. Asserted against every status.
+
+Status updates use a compare-and-set (`UPDATE ... WHERE id = ? AND status = ?`). If two reviewers act at the
+same time, the second gets a `409 concurrent_update` instead of overwriting the first decision. That is
+optimistic concurrency, the same idea as a `rowversion` check in EF Core.
 
 ## E8: secrets are clean
 

@@ -14,7 +14,7 @@ is the job store. Variant text comes from templates (no AI).
 | Table | Key columns | Notes |
 |---|---|---|
 | `posts` | id, source_type (`url`/`markdown`), source_url, title, body_md, tags, created_at | Single source of truth. URL is fetched **once** at ingest; generation reads only this row. |
-| `variants` | id, post_id, platform (`x`/`linkedin`/`discord`), text, status, created_at, updated_at | status: `draft` → `approved` / `rejected` → `published`. A row exists only if it passed its profile. |
+| `variants` | id, post_id, platform (`x`/`linkedin`/`discord`), text, status, shaping_notes, created_at, updated_at | status: `draft` → `approved` / `rejected` → `published`. A row exists only if it passed its profile. `shaping_notes` is a JSON list of what generation changed (see below). |
 | `jobs` | id, variant_id, slot_at (UTC, whole minute), **idempotency_key UNIQUE**, status, attempts, run_after, claimed_by, lease_until, last_error | key = `variant:{id}:slot:{slot_at}`. status: `pending` / `claimed` / `succeeded` / `failed` / `unknown` / `cancelled`. |
 | `publish_attempts` | id, job_id, attempt_no, adapter, outcome, external_id, external_url, error, started_at, finished_at | outcome: `in_flight` / `succeeded` / `failed` / `ambiguous`. **Partial unique index: one `succeeded` per job.** This is the publish history. |
 | `mock_posts` | id, adapter, idempotency_key, text, created_at; UNIQUE(adapter, idempotency_key) | What a mock "would have posted". Has a preview page. |
@@ -72,6 +72,26 @@ interface SocialPublisher {
 A violation returns **422** `{ error: "constraint_violation", violations: [{ rule: "max_length", platform: "x", limit: 280, actual: 312, message }] }`.
 The generator shapes its text to fit (it truncates at a word boundary and takes the top N tags). Its output is
 validated anyway, so a broken template can never reach review.
+
+### Shaping is recorded, never silent
+Shaping does not only cut length: it rewrites the author's words. It de-shouts ALL-CAPS words, reduces
+exclamation marks, drops forbidden slang and mass mentions, and drops links from the source text in favour of
+the canonical one. Each variant therefore stores `shaping_notes`, a list of plain-language notes
+("normalised 2 all-caps words (ALWAYS, SHIPPED)", "removed 1 banned word (lol)"), returned by
+`POST /posts/:id/generate` and by every variant read.
+
+**Why.** A reviewer approves the final text, so no unapproved wording can ever be published, and in that sense
+silence would be safe. It would still be wrong. The reviewer is approving words that differ from what the
+author wrote, and without the notes they cannot see which differences were ours. A diff against the source is
+not enough either: it shows *that* text changed, not *which rule* caused it. The notes make the system's
+edits auditable and explain themselves in terms of the profile.
+
+Two rules follow from this:
+- **Shaping changes only what a profile actually requires.** `!!!` is left alone on Discord, which permits
+  three, and reduced on X, which permits one. Shaping never touches text that would already pass.
+- **Shaping never changes meaning.** Nothing is reworded, and no claim is added or removed. Only length,
+  capitalisation, punctuation count, listed slang and link placement are touched. A hand-written variant is
+  never shaped at all, so its notes are always empty.
 
 ## API surface (JSON)
 | Method & path | Purpose |

@@ -3,7 +3,7 @@ import { describe, it } from 'node:test';
 import type { Post } from '../posts/repository.js';
 import { PLATFORMS } from '../config.js';
 import { validateVariant } from '../platforms/validate.js';
-import { generateVariantText, truncateAtWord } from './generator.js';
+import { generateVariant, generateVariantText, truncateAtWord } from './generator.js';
 
 function post(overrides: Partial<Post> = {}): Post {
   return {
@@ -106,6 +106,60 @@ describe('long posts are truncated to fit', () => {
     const text = generateVariantText(withUrl, 'x');
     assert.ok(text.includes('https://example.com/blog/durable-publishing'), text);
     assert.deepEqual(validateVariant('x', text), []);
+  });
+});
+
+describe('shaping is recorded, not silent', () => {
+  it('reports every change it made to the source text', () => {
+    const messy = post({
+      bodyMd:
+        '# Heading\n\nALWAYS assume the worker can die!!! lol. ' +
+        'See https://example.com/old for the SHOUTED details, @everyone.',
+    });
+    const { notes } = generateVariant(messy, 'x');
+    const kinds = notes.map((note) => note.kind);
+
+    assert.ok(kinds.includes('normalised_shouting'), JSON.stringify(notes));
+    assert.ok(kinds.includes('reduced_exclamations'), JSON.stringify(notes));
+    assert.ok(kinds.includes('removed_banned_words'), JSON.stringify(notes));
+    assert.ok(kinds.includes('removed_mass_mentions'), JSON.stringify(notes));
+    assert.ok(kinds.includes('dropped_source_links'), JSON.stringify(notes));
+    assert.ok(kinds.includes('selected_tags'), JSON.stringify(notes));
+  });
+
+  it('counts across the whole variant, naming the words it changed', () => {
+    const messy = post({ bodyMd: '# Heading\n\nALWAYS check. SHIPPED means nothing.' });
+    const note = generateVariant(messy, 'x').notes.find((n) => n.kind === 'normalised_shouting');
+    assert.equal(note?.message, 'normalised 2 all-caps words (ALWAYS, SHIPPED)');
+  });
+
+  it('uses the singular for a single change', () => {
+    const messy = post({ bodyMd: '# Heading\n\nALWAYS check this before shipping anything.' });
+    const note = generateVariant(messy, 'x').notes.find((n) => n.kind === 'normalised_shouting');
+    assert.equal(note?.message, 'normalised 1 all-caps word (ALWAYS)');
+  });
+
+  it('records truncation with the limit that applied', () => {
+    // One sentence longer than X's limit. Many short sentences would not truncate,
+    // because the X template only takes the first one.
+    const long = post({ bodyMd: `# Heading\n\n${'claim the job then send '.repeat(30)}.` });
+    const note = generateVariant(long, 'x').notes.find((n) => n.kind === 'truncated');
+    assert.equal(note?.message, 'truncated the body to fit 280 characters');
+  });
+
+  it('reports nothing when the source needed no shaping', () => {
+    const clean = post({
+      bodyMd: '# Heading\n\nA retry after a timeout can create a duplicate post. The fix is a key.',
+      tags: ['backend'],
+    });
+    assert.deepEqual(generateVariant(clean, 'discord').notes, []);
+  });
+
+  it('records no tone changes for Discord, whose profile permits them', () => {
+    const messy = post({ bodyMd: '# Heading\n\nALWAYS assume the worker can die. lol.' });
+    const kinds = generateVariant(messy, 'discord').notes.map((n) => n.kind);
+    assert.ok(!kinds.includes('normalised_shouting'), JSON.stringify(kinds));
+    assert.ok(!kinds.includes('removed_banned_words'), JSON.stringify(kinds));
   });
 });
 
